@@ -1,0 +1,590 @@
+/**
+ * 全局状态容器（ADR-005）：Context + useReducer。
+ * 架构约束：只有这里可以触网 / 读写 localStorage，组件层保持纯展示。
+ */
+import {
+  createContext,
+  useCallback,
+  useContext,
+  useEffect,
+  useMemo,
+  useReducer,
+  useRef,
+  type ReactNode,
+} from 'react';
+
+import type {
+  AuditEntry,
+  ChatMessage,
+  HealthInfo,
+  RawTaskPayload,
+  ServerEvent,
+  Settings,
+  Task,
+  TaskCandidate,
+  TaskStatus,
+} from '../types.ts';
+import { buildRequestMessages, hasCredentials, loadSettings, normalizeSettings, saveSettings } from '../lib/settings.ts';
+import { STORAGE_KEYS, isArrayOfObjects, loadJson, removeKeys, saveJson } from '../lib/storage.ts';
+import { createId } from '../lib/id.ts';
+import { ApiError, fetchHealth, fetchModels, streamChat } from '../lib/api.ts';
+import { candidateFromToolPayload, runExtraction, taskFromCandidate } from '../lib/extract.ts';
+import { dedupeCandidates } from '../lib/dedupe.ts';
+
+/* ------------------------------------------------------------------ *
+ * 状态与行为
+ * ------------------------------------------------------------------ */
+
+interface State {
+  settings: Settings;
+  messages: ChatMessage[];
+  tasks: Task[];
+  candidates: TaskCandidate[];
+  audits: AuditEntry[];
+  health: HealthInfo | null;
+  healthError: string | null;
+  busy: boolean;
+  streamingMessageId: string | null;
+  highlightMessageId: string | null;
+  toast: string | null;
+}
+
+type Action =
+  | { type: 'settings/set'; payload: Settings }
+  | { type: 'health/set'; payload: { health: HealthInfo | null; error: string | null } }
+  | { type: 'message/add'; payload: ChatMessage }
+  | { type: 'message/append'; payload: { id: string; kind: 'content' | 'reasoning'; text: string } }
+  | { type: 'message/finish'; payload: { id: string; status: ChatMessage['status']; errorText?: string } }
+  | { type: 'message/clear' }
+  | { type: 'message/highlight'; payload: string | null }
+  | { type: 'tasks/addMany'; payload: Task[] }
+  | { type: 'tasks/status'; payload: { id: string; status: TaskStatus } }
+  | { type: 'tasks/remove'; payload: string }
+  | { type: 'tasks/clear' }
+  | { type: 'candidates/push'; payload: TaskCandidate[] }
+  | { type: 'candidates/remove'; payload: string }
+  | { type: 'candidates/clear' }
+  | { type: 'audit/push'; payload: AuditEntry }
+  | { type: 'busy/set'; payload: boolean }
+  | { type: 'streaming/set'; payload: string | null }
+  | { type: 'toast/set'; payload: string | null }
+  | { type: 'data/reset'; payload: Settings };
+
+const MAX_AUDITS = 40;
+
+function normalizeTask(raw: unknown): Task | null {
+  if (!raw || typeof raw !== 'object') return null;
+  const source = raw as Record<string, unknown>;
+  const title = typeof source.title === 'string' ? source.title.trim() : '';
+  if (!title) return null;
+  const statuses: TaskStatus[] = ['pending', 'active', 'done', 'dropped'];
+  const status = statuses.includes(source.status as TaskStatus) ? (source.status as TaskStatus) : 'pending';
+  const createdAt = typeof source.createdAt === 'number' ? source.createdAt : Date.now();
+  return {
+    id: typeof source.id === 'string' && source.id ? source.id : createId('task'),
+    title,
+    detail: typeof source.detail === 'string' ? source.detail : title,
+    category: (['feature', 'bug', 'content', 'question', 'other'] as const).includes(
+      source.category as Task['category'],
+    )
+      ? (source.category as Task['category'])
+      : 'feature',
+    priority: (['P0', 'P1', 'P2'] as const).includes(source.priority as Task['priority'])
+      ? (source.priority as Task['priority'])
+      : 'P1',
+    acceptance: Array.isArray(source.acceptance)
+      ? source.acceptance.filter((x): x is string => typeof x === 'string')
+      : [],
+    confidence: typeof source.confidence === 'number' ? source.confidence : 0.7,
+    origin: source.origin === 'rule' ? 'rule' : 'llm',
+    evidence: typeof source.evidence === 'string' ? source.evidence : '',
+    sourceMessageId: typeof source.sourceMessageId === 'string' ? source.sourceMessageId : null,
+    triggerReasons: Array.isArray(source.triggerReasons)
+      ? source.triggerReasons.filter((x): x is string => typeof x === 'string')
+      : [],
+    status,
+    createdAt,
+    updatedAt: typeof source.updatedAt === 'number' ? source.updatedAt : createdAt,
+  };
+}
+
+function createInitialState(): State {
+  const settings = loadSettings();
+  const messages = loadJson<ChatMessage[]>(STORAGE_KEYS.messages, [], isArrayOfObjects)
+    .filter((m) => m && typeof m.content === 'string' && (m.role === 'user' || m.role === 'assistant'))
+    .map<ChatMessage>((m) => ({
+      ...m,
+      // 上次没写完就关页面的消息，标记为已中断
+      status: m.status === 'streaming' ? 'aborted' : m.status,
+    }));
+  const tasks = loadJson<unknown[]>(STORAGE_KEYS.tasks, [], isArrayOfObjects)
+    .map(normalizeTask)
+    .filter((t): t is Task => t !== null);
+
+  return {
+    settings,
+    messages,
+    tasks,
+    candidates: [],
+    audits: [],
+    health: null,
+    healthError: null,
+    busy: false,
+    streamingMessageId: null,
+    highlightMessageId: null,
+    toast: null,
+  };
+}
+
+function reducer(state: State, action: Action): State {
+  switch (action.type) {
+    case 'settings/set':
+      return { ...state, settings: action.payload };
+    case 'health/set':
+      return { ...state, health: action.payload.health, healthError: action.payload.error };
+    case 'message/add':
+      return { ...state, messages: [...state.messages, action.payload] };
+    case 'message/append':
+      return {
+        ...state,
+        messages: state.messages.map((message) => {
+          if (message.id !== action.payload.id) return message;
+          if (action.payload.kind === 'reasoning') {
+            return { ...message, reasoning: (message.reasoning ?? '') + action.payload.text };
+          }
+          return { ...message, content: message.content + action.payload.text };
+        }),
+      };
+    case 'message/finish':
+      return {
+        ...state,
+        messages: state.messages.map((message) =>
+          message.id === action.payload.id
+            ? {
+                ...message,
+                status: action.payload.status,
+                ...(action.payload.errorText ? { errorText: action.payload.errorText } : {}),
+              }
+            : message,
+        ),
+      };
+    case 'message/clear':
+      return { ...state, messages: [], highlightMessageId: null };
+    case 'message/highlight':
+      return { ...state, highlightMessageId: action.payload };
+    case 'tasks/addMany':
+      return { ...state, tasks: [...action.payload, ...state.tasks] };
+    case 'tasks/status':
+      return {
+        ...state,
+        tasks: state.tasks.map((task) =>
+          task.id === action.payload.id ? { ...task, status: action.payload.status, updatedAt: Date.now() } : task,
+        ),
+      };
+    case 'tasks/remove':
+      return { ...state, tasks: state.tasks.filter((task) => task.id !== action.payload) };
+    case 'tasks/clear':
+      return { ...state, tasks: [], candidates: [] };
+    case 'candidates/push':
+      return { ...state, candidates: [...state.candidates, ...action.payload] };
+    case 'candidates/remove':
+      return { ...state, candidates: state.candidates.filter((candidate) => candidate.id !== action.payload) };
+    case 'candidates/clear':
+      return { ...state, candidates: [] };
+    case 'audit/push':
+      return { ...state, audits: [action.payload, ...state.audits].slice(0, MAX_AUDITS) };
+    case 'busy/set':
+      return { ...state, busy: action.payload };
+    case 'streaming/set':
+      return { ...state, streamingMessageId: action.payload };
+    case 'toast/set':
+      return { ...state, toast: action.payload };
+    case 'data/reset':
+      return { ...createInitialState(), settings: action.payload };
+    default:
+      return state;
+  }
+}
+
+/* ------------------------------------------------------------------ *
+ * Context
+ * ------------------------------------------------------------------ */
+
+export interface StoreValue {
+  state: State;
+  send: (text: string) => Promise<void>;
+  stop: () => void;
+  updateSettings: (patch: Partial<Settings>) => void;
+  acceptCandidate: (id: string) => void;
+  dropCandidate: (id: string) => void;
+  acceptAllCandidates: () => void;
+  setTaskStatus: (id: string, status: TaskStatus) => void;
+  removeTask: (id: string) => void;
+  clearMessages: () => void;
+  clearTasks: () => void;
+  resetAll: () => void;
+  refreshHealth: () => Promise<void>;
+  testConnection: () => Promise<{ ok: boolean; message: string }>;
+  listModels: (draft: { baseUrl: string; apiKey: string }) => Promise<string[]>;
+  setToast: (message: string | null) => void;
+  highlightMessage: (id: string | null) => void;
+  configured: boolean;
+}
+
+const StoreContext = createContext<StoreValue | null>(null);
+
+export function StoreProvider({ children }: { children: ReactNode }) {
+  const [state, dispatch] = useReducer(reducer, undefined, createInitialState);
+  const stateRef = useRef(state);
+  stateRef.current = state;
+  const abortRef = useRef<AbortController | null>(null);
+  const toastTimer = useRef<number | null>(null);
+
+  /* -------------------- 持久化（防抖，避免流式期间频繁写入） -------------------- */
+  useEffect(() => {
+    const timer = setTimeout(() => saveJson(STORAGE_KEYS.messages, state.messages), 500);
+    return () => clearTimeout(timer);
+  }, [state.messages]);
+
+  useEffect(() => {
+    saveJson(STORAGE_KEYS.tasks, state.tasks);
+  }, [state.tasks]);
+
+  useEffect(() => {
+    saveSettings(state.settings);
+  }, [state.settings]);
+
+  useEffect(() => {
+    if (!state.toast) return;
+    if (toastTimer.current !== null) window.clearTimeout(toastTimer.current);
+    toastTimer.current = window.setTimeout(() => dispatch({ type: 'toast/set', payload: null }), 3200);
+    return () => {
+      if (toastTimer.current !== null) window.clearTimeout(toastTimer.current);
+    };
+  }, [state.toast]);
+
+  /* -------------------- 健康检查 -------------------- */
+  const refreshHealth = useCallback(async () => {
+    try {
+      const health = await fetchHealth();
+      dispatch({ type: 'health/set', payload: { health, error: null } });
+    } catch (err) {
+      dispatch({
+        type: 'health/set',
+        payload: { health: null, error: err instanceof ApiError ? err.message : '后端服务不可用' },
+      });
+    }
+  }, []);
+
+  useEffect(() => {
+    void refreshHealth();
+  }, [refreshHealth]);
+
+  /* -------------------- 发送一轮对话 -------------------- */
+  const send = useCallback(async (raw: string) => {
+    const text = raw.trim();
+    const current = stateRef.current;
+    if (!text || current.busy) return;
+
+    const settings = current.settings;
+    const userMessage: ChatMessage = {
+      id: createId('msg'),
+      role: 'user',
+      content: text,
+      createdAt: Date.now(),
+      status: 'done',
+    };
+    const assistantMessage: ChatMessage = {
+      id: createId('msg'),
+      role: 'assistant',
+      content: '',
+      createdAt: Date.now(),
+      status: 'streaming',
+    };
+
+    const history = [...current.messages, userMessage]
+      .filter((m) => m.role === 'user' || m.role === 'assistant')
+      .map((m) => ({ role: m.role as 'user' | 'assistant', content: m.content }));
+
+    dispatch({ type: 'message/add', payload: userMessage });
+    dispatch({ type: 'message/add', payload: assistantMessage });
+    dispatch({ type: 'busy/set', payload: true });
+    dispatch({ type: 'streaming/set', payload: assistantMessage.id });
+
+    const controller = new AbortController();
+    abortRef.current = controller;
+
+    let assistantText = '';
+    const toolCandidates: TaskCandidate[] = [];
+    const notices: string[] = [];
+    let streamError: string | null = null;
+    const startedAt = Date.now();
+
+    try {
+      await streamChat({
+        settings,
+        messages: buildRequestMessages(settings, history),
+        signal: controller.signal,
+        onEvent: (event: ServerEvent) => {
+          switch (event.type) {
+            case 'delta':
+              assistantText += event.text;
+              dispatch({ type: 'message/append', payload: { id: assistantMessage.id, kind: 'content', text: event.text } });
+              break;
+            case 'reasoning':
+              dispatch({
+                type: 'message/append',
+                payload: { id: assistantMessage.id, kind: 'reasoning', text: event.text },
+              });
+              break;
+            case 'tool_call': {
+              const candidate = candidateFromToolPayload(
+                event.task as RawTaskPayload,
+                assistantText || event.task.detail,
+                assistantMessage.id,
+              );
+              toolCandidates.push(candidate);
+              break;
+            }
+            case 'notice':
+              notices.push(event.message);
+              break;
+            case 'error':
+              streamError = event.message;
+              break;
+            default:
+              break;
+          }
+        },
+      });
+    } catch (err) {
+      if ((err as Error)?.name === 'AbortError') {
+        // 用户主动停止，不算错误
+      } else {
+        streamError = err instanceof ApiError ? err.message : ((err as Error)?.message ?? '请求失败');
+      }
+    } finally {
+      abortRef.current = null;
+    }
+
+    const aborted = controller.signal.aborted;
+    dispatch({
+      type: 'message/finish',
+      payload: {
+        id: assistantMessage.id,
+        status: streamError ? 'error' : aborted ? 'aborted' : 'done',
+        ...(streamError ? { errorText: streamError } : {}),
+      },
+    });
+    dispatch({ type: 'busy/set', payload: false });
+    dispatch({ type: 'streaming/set', payload: null });
+
+    if (streamError && !assistantText) {
+      dispatch({
+        type: 'audit/push',
+        payload: {
+          id: createId('audit'),
+          at: Date.now(),
+          messageId: assistantMessage.id,
+          triggered: false,
+          reasons: [],
+          channel: 'none',
+          produced: 0,
+          dropped: 0,
+          durationMs: Date.now() - startedAt,
+          note: `对话失败：${streamError}`,
+        },
+      });
+      return;
+    }
+
+    /* -------------------- 抽取通道 -------------------- */
+    const existingTitles = stateRef.current.tasks.map((task) => task.title);
+    const toolDedupe = dedupeCandidates(toolCandidates, existingTitles, settings.dedupeThreshold);
+
+    const outcome = await runExtraction({
+      text: assistantText,
+      context: text,
+      settings,
+      serverHasKey: stateRef.current.health?.defaults.hasKey ?? false,
+      existingTitles: [...existingTitles, ...toolDedupe.kept.map((c) => c.title)],
+      sourceMessageId: assistantMessage.id,
+    });
+
+    const fresh = [...toolDedupe.kept, ...outcome.candidates];
+    const channel: AuditEntry['channel'] =
+      toolDedupe.kept.length > 0 ? 'tool' : outcome.channel === 'none' ? 'none' : outcome.channel;
+
+    if (fresh.length > 0) {
+      if (settings.autoAccept) {
+        const newTasks = fresh.map((candidate) => taskFromCandidate(candidate, 'pending'));
+        dispatch({ type: 'tasks/addMany', payload: newTasks });
+        dispatch({ type: 'toast/set', payload: `已自动接取 ${newTasks.length} 条任务` });
+      } else {
+        dispatch({ type: 'candidates/push', payload: fresh });
+      }
+    }
+
+    dispatch({
+      type: 'audit/push',
+      payload: {
+        id: createId('audit'),
+        at: Date.now(),
+        messageId: assistantMessage.id,
+        triggered: toolDedupe.kept.length > 0 || outcome.triggered,
+        reasons: outcome.reasons,
+        channel,
+        produced: fresh.length,
+        dropped: toolDedupe.dropped.length + outcome.dropped.length,
+        durationMs: Date.now() - startedAt,
+        ...(outcome.note || notices.length > 0
+          ? { note: [...notices, outcome.note].filter(Boolean).join('；') }
+          : {}),
+      },
+    });
+
+    if (notices.length > 0) dispatch({ type: 'toast/set', payload: notices[0] });
+  }, []);
+
+  const stop = useCallback(() => {
+    abortRef.current?.abort();
+  }, []);
+
+  const updateSettings = useCallback((patch: Partial<Settings>) => {
+    const next = normalizeSettings({ ...stateRef.current.settings, ...patch });
+    dispatch({ type: 'settings/set', payload: next });
+  }, []);
+
+  const acceptCandidate = useCallback((id: string) => {
+    const candidate = stateRef.current.candidates.find((item) => item.id === id);
+    if (!candidate) return;
+    dispatch({ type: 'tasks/addMany', payload: [taskFromCandidate(candidate, 'pending')] });
+    dispatch({ type: 'candidates/remove', payload: id });
+    dispatch({ type: 'toast/set', payload: `已接取任务：${candidate.title}` });
+  }, []);
+
+  const acceptAllCandidates = useCallback(() => {
+    const list = stateRef.current.candidates;
+    if (list.length === 0) return;
+    dispatch({ type: 'tasks/addMany', payload: list.map((candidate) => taskFromCandidate(candidate, 'pending')) });
+    dispatch({ type: 'candidates/clear' });
+    dispatch({ type: 'toast/set', payload: `已接取 ${list.length} 条任务` });
+  }, []);
+
+  const dropCandidate = useCallback((id: string) => {
+    dispatch({ type: 'candidates/remove', payload: id });
+  }, []);
+
+  const setTaskStatus = useCallback((id: string, status: TaskStatus) => {
+    dispatch({ type: 'tasks/status', payload: { id, status } });
+  }, []);
+
+  const removeTask = useCallback((id: string) => {
+    dispatch({ type: 'tasks/remove', payload: id });
+  }, []);
+
+  const clearMessages = useCallback(() => {
+    dispatch({ type: 'message/clear' });
+    dispatch({ type: 'candidates/clear' });
+  }, []);
+
+  const clearTasks = useCallback(() => {
+    dispatch({ type: 'tasks/clear' });
+  }, []);
+
+  const resetAll = useCallback(() => {
+    removeKeys([STORAGE_KEYS.settings, STORAGE_KEYS.messages, STORAGE_KEYS.tasks]);
+    dispatch({ type: 'data/reset', payload: normalizeSettings(loadSettings()) });
+    dispatch({ type: 'toast/set', payload: '已清空本地数据' });
+  }, []);
+
+  const setToast = useCallback((message: string | null) => {
+    dispatch({ type: 'toast/set', payload: message });
+  }, []);
+
+  /** 拉取上游模型列表（AC-3.2），使用设置面板里尚未保存的草稿值。 */
+  const listModels = useCallback(
+    async (draft: { baseUrl: string; apiKey: string }): Promise<string[]> =>
+      fetchModels({ ...stateRef.current.settings, baseUrl: draft.baseUrl, apiKey: draft.apiKey }),
+    [],
+  );
+
+  /** 设置面板里的「测试对话」：不污染当前会话（AC-3.3）。 */
+  const testConnection = useCallback(async (): Promise<{ ok: boolean; message: string }> => {
+    const settings = stateRef.current.settings;
+    let received = '';
+    let failure: string | null = null;
+    try {
+      await streamChat({
+        settings: { ...settings, enableTools: false },
+        messages: [
+          { role: 'system', content: '只回答两个字：可以' },
+          { role: 'user', content: '连通性测试' },
+        ],
+        onEvent: (event) => {
+          if (event.type === 'delta') received += event.text;
+          if (event.type === 'error') failure = event.message;
+        },
+      });
+    } catch (err) {
+      failure = err instanceof ApiError ? err.message : ((err as Error)?.message ?? '未知错误');
+    }
+    if (failure) return { ok: false, message: failure };
+    if (!received.trim()) return { ok: false, message: '连接成功但没有收到内容，请检查模型名' };
+    return { ok: true, message: `连接正常，模型回复：${received.trim().slice(0, 30)}` };
+  }, []);
+
+  const highlightMessage = useCallback((id: string | null) => {
+    dispatch({ type: 'message/highlight', payload: id });
+  }, []);
+
+  const value = useMemo<StoreValue>(
+    () => ({
+      state,
+      send,
+      stop,
+      updateSettings,
+      acceptCandidate,
+      dropCandidate,
+      acceptAllCandidates,
+      setTaskStatus,
+      removeTask,
+      clearMessages,
+      clearTasks,
+      resetAll,
+      refreshHealth,
+      testConnection,
+      listModels,
+      setToast,
+      highlightMessage,
+      configured: hasCredentials(state.settings, state.health?.defaults.hasKey ?? false),
+    }),
+    [
+      state,
+      send,
+      stop,
+      updateSettings,
+      acceptCandidate,
+      dropCandidate,
+      acceptAllCandidates,
+      setTaskStatus,
+      removeTask,
+      clearMessages,
+      clearTasks,
+      resetAll,
+      refreshHealth,
+      testConnection,
+      listModels,
+      setToast,
+      highlightMessage,
+    ],
+  );
+
+  return <StoreContext.Provider value={value}>{children}</StoreContext.Provider>;
+}
+
+export function useStore(): StoreValue {
+  const context = useContext(StoreContext);
+  if (!context) throw new Error('useStore 必须在 StoreProvider 内部使用');
+  return context;
+}

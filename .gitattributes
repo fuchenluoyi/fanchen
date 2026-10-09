@@ -1,0 +1,15 @@
+# 换行统一：仓库内一律 LF，但 .cmd/.bat 检出时必须保持 CRLF，
+# 否则中文 cmd（代码页 936）解析批处理会出问题。
+* text=auto eol=lf
+*.cmd text eol=crlf
+*.bat text eol=crlf
+*.ps1 text eol=crlf
+
+# 二进制资源不做任何转换
+*.png binary
+*.jpg binary
+*.jpeg binary
+*.gif binary
+*.ico binary
+*.woff binary
+*.woff2 binary
