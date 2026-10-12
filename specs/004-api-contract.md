@@ -116,10 +116,30 @@ Base：开发环境 `http://localhost:8787`（Vite 会把 `/api/*` 代理过来�
   "text": "好的，我记下了。",
   "reasoning": "",
   "toolCalls": [ { "index": 0, "task": { "title": "...", "detail": "..." } } ],
+  "questCalls": [ { "index": 0, "id": "call_1", "event": { "type": "quest_proposal", "proposal": { } } } ],
   "notices": [ { "code": "tools_unsupported", "message": "..." } ],
   "usage": { "prompt_tokens": 12, "completion_tokens": 34 }
 }
 ```
+
+### 2.3 委托工具通道（可选，`questTools: true`）
+
+请求体带上 `"questTools": true` 时，服务端在 `create_task` 之外再暴露三个**提案型**工具
+（`propose_quest` / `submit_quest` / `decline_quest`，定义见 `server/lib/quest-tools.mjs`）；
+不带该字段时行为与从前完全一致。
+
+| SSE 事件 | 载荷 | 含义 |
+| --- | --- | --- |
+| `quest_proposal` | `{ index, proposal }` | NPC 提议发布一条委托；`proposal` 已归一化为领域层输入：`{ title, want, tier, objective, reward, offerLevel? }` |
+| `quest_submit` | `{ index, submission }` | 模型识别到"玩家把东西交给你"，请求系统核验并结算：`{ questId, deliver? }` |
+| `quest_decline` | `{ index, decline }` | 玩家表示不接这条委托：`{ questId, reason? }` |
+
+归一化失败（缺字段、枚举不对、类型错）**不发**上述事件，改发一条 `notice`：
+`code = "quest_call_rejected"`，`message` 带可读原因。
+
+**职责边界（ADR-013）**：服务端只做**形状**归一化（枚举、必填、类型）；
+**规则**裁决（道具白名单、奖励档位、库存预留、幂等、守恒）全部在前端领域层 `src/lib/quest/` 完成 ——
+服务端不复制那套规则，也不持有世界状态。
 
 ---
 

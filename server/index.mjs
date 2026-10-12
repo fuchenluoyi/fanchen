@@ -10,6 +10,7 @@ import { fileURLToPath } from 'node:url';
 
 import { HttpError, applyCors, sendJson, sendError, readJsonBody, serveStatic } from './lib/http.mjs';
 import { sseEncode, iterateSse, parseSseData } from './lib/sse.mjs';
+import { QUEST_TOOLS, QUEST_TOOL_NAMES, mapQuestToolCall } from './lib/quest-tools.mjs';
 import {
   DEFAULT_BASE_URL,
   DEFAULT_MODEL,
@@ -160,6 +161,8 @@ async function handleChat(req, res) {
   const temperature = clampNumber(body.temperature, 0, 2, 0.8);
   const wantStream = body.stream !== false;
   const enableTools = body.enableTools !== false;
+  // 委托工具是可选通道：前端显式带上 questTools 才把 NPC 委托能力交给模型（ADR-013）
+  const enableQuestTools = body.questTools === true;
 
   const controller = new AbortController();
   // 只在连接真的断开时中断；响应正常结束不算
@@ -171,7 +174,7 @@ async function handleChat(req, res) {
   /** @type {Array<{code: string; message: string}>} */
   const notices = [];
   const payload = { model, messages, temperature, stream: wantStream };
-  if (enableTools) payload.tools = [TASK_TOOL];
+  if (enableTools) payload.tools = enableQuestTools ? [TASK_TOOL, ...QUEST_TOOLS] : [TASK_TOOL];
 
   let response = await callChatCompletions({ baseUrl, apiKey, payload, signal });
 
@@ -209,16 +212,27 @@ async function handleChat(req, res) {
     const message = parsed?.choices?.[0]?.message ?? {};
     /** @type {Array<{index: number; id: string; task: Record<string, unknown>}>} */
     const toolCalls = [];
+    /** @type {Array<{index: number; id: string; event: Record<string, unknown>}>} */
+    const questCalls = [];
     for (const call of Array.isArray(message.tool_calls) ? message.tool_calls : []) {
-      if (call?.function?.name !== 'create_task') continue;
-      const result = normalizeExtractedTask(parseJsonLoose(call?.function?.arguments ?? ''));
-      if (result.ok) toolCalls.push({ index: toolCalls.length, id: String(call?.id ?? ''), task: result.task });
-      else notices.push({ code: 'tool_call_rejected', message: `模型提交的任务参数不合法：${result.reason}` });
+      const name = String(call?.function?.name ?? '');
+      const args = parseJsonLoose(call?.function?.arguments ?? '');
+      if (name === 'create_task') {
+        const result = normalizeExtractedTask(args);
+        if (result.ok) toolCalls.push({ index: toolCalls.length, id: String(call?.id ?? ''), task: result.task });
+        else notices.push({ code: 'tool_call_rejected', message: `模型提交的任务参数不合法：${result.reason}` });
+        continue;
+      }
+      if (!enableQuestTools || !QUEST_TOOL_NAMES.includes(name)) continue;
+      const mapped = mapQuestToolCall(name, args);
+      if (mapped.ok) questCalls.push({ index: questCalls.length, id: String(call?.id ?? ''), event: mapped.event });
+      else notices.push({ code: 'quest_call_rejected', message: `模型提交的委托参数不合法：${mapped.reason}` });
     }
     sendJson(res, 200, {
       text: typeof message.content === 'string' ? message.content : '',
       reasoning: typeof message.reasoning_content === 'string' ? message.reasoning_content : '',
       toolCalls,
+      questCalls,
       notices,
       usage: parsed?.usage ?? null,
     });
@@ -281,10 +295,17 @@ async function handleChat(req, res) {
   if (!streamFailed) {
     // 流结束后统一 flush 拼装好的工具调用（AC-4.2）
     for (const slot of assembler.list()) {
-      if (slot.name !== 'create_task') continue;
-      const result = normalizeExtractedTask(parseJsonLoose(slot.args));
-      if (result.ok) write({ type: 'tool_call', index: slot.index, task: result.task });
-      else write({ type: 'notice', code: 'tool_call_rejected', message: `模型提交的任务参数不合法：${result.reason}` });
+      const args = parseJsonLoose(slot.args);
+      if (slot.name === 'create_task') {
+        const result = normalizeExtractedTask(args);
+        if (result.ok) write({ type: 'tool_call', index: slot.index, task: result.task });
+        else write({ type: 'notice', code: 'tool_call_rejected', message: `模型提交的任务参数不合法：${result.reason}` });
+        continue;
+      }
+      if (!enableQuestTools || !QUEST_TOOL_NAMES.includes(slot.name)) continue;
+      const mapped = mapQuestToolCall(slot.name, args);
+      if (mapped.ok) write({ index: slot.index, ...mapped.event });
+      else write({ type: 'notice', code: 'quest_call_rejected', message: `模型提交的委托参数不合法：${mapped.reason}` });
     }
   }
   if (usage) write({ type: 'usage', usage });

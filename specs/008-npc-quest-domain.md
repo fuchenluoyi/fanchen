@@ -187,3 +187,25 @@ offered ──accept──▶ accepted ──submit──▶ settled
 | `tests/quest.adjudicate.test.ts` | 24 / 24 |
 | 全仓库单测 | 92 / 92（原有 40 + 本轮 52） |
 | `node scripts/quest-smoke.ts` | 通过（退出码 0，含 5 条拒绝路径与守恒核对） |
+
+## 12. 工具通道（T9，服务端已就绪 / 前端未接）
+
+**已完成（服务端）**
+
+- `server/lib/quest-tools.mjs`：三个提案型工具的定义（`propose_quest` / `submit_quest` / `decline_quest`）
+  与参数归一化。模型给的是扁平参数，这里收敛成领域层要的 `{ title, want, tier, objective, reward, offerLevel? }`。
+- `server/index.mjs`：请求体带 `questTools: true` 时把这三个工具一并交给模型，并把工具调用映射成
+  `quest_proposal` / `quest_submit` / `quest_decline` 三类 SSE 事件（非流式走 `questCalls` 数组）；
+  归一化失败发 `notice`（`quest_call_rejected`）。不带该字段时行为与从前完全一致。
+- 契约见 [004 §2.3](./004-api-contract.md)，决策见 [ADR-013](./007-decisions.md)。
+
+**验证**：`tests/quest.tools.test.ts` 14 例通过；另做过一次进程内端到端验证
+（模拟上游分三片吐 `tool_calls` + 真起后端，流式 / 未开启 / 非流式三条路径全通），验证脚本跑完即删。
+
+**未完成（下一步）**
+
+1. 前端消费这三类事件：把 `World` 接进 store（新增持久化 key），`quest_proposal` → 委托卡 → 玩家接取；
+   拒绝则展示原因并记入审计。
+2. 只读真相注入：按 ADR-013 只注入 NPC 自己视角（自己的背包、自己的委托、道具白名单、好感度）。
+3. 裁决结论（尤其拒绝原因）回注给模型，作为 NPC 下一轮的事实。
+4. 系统提示词改写：从「记录玩家需求」改为「NPC 发布委托」的框架。
