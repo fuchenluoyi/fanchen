@@ -188,7 +188,7 @@ offered ──accept──▶ accepted ──submit──▶ settled
 | 全仓库单测 | 92 / 92（原有 40 + 本轮 52） |
 | `node scripts/quest-smoke.ts` | 通过（退出码 0，含 5 条拒绝路径与守恒核对） |
 
-## 12. 工具通道（T9，服务端已就绪 / 前端未接）
+## 12. 工具通道与前端接入（T9 + T10）
 
 **已完成（服务端）**
 
@@ -202,10 +202,22 @@ offered ──accept──▶ accepted ──submit──▶ settled
 **验证**：`tests/quest.tools.test.ts` 14 例通过；另做过一次进程内端到端验证
 （模拟上游分三片吐 `tool_calls` + 真起后端，流式 / 未开启 / 非流式三条路径全通），验证脚本跑完即删。
 
-**未完成（下一步）**
+**已完成（前端接入 · T10）**
 
-1. 前端消费这三类事件：把 `World` 接进 store（新增持久化 key），`quest_proposal` → 委托卡 → 玩家接取；
-   拒绝则展示原因并记入审计。
-2. 只读真相注入：按 ADR-013 只注入 NPC 自己视角（自己的背包、自己的委托、道具白名单、好感度）。
-3. 裁决结论（尤其拒绝原因）回注给模型，作为 NPC 下一轮的事实。
-4. 系统提示词改写：从「记录玩家需求」改为「NPC 发布委托」的框架。
+- `src/lib/quest/prompt.ts`：`buildNpcSystemPrompt(world, npcId, lastRuling, customPersona)` ——
+  只注入 NPC 自身视角（**不含玩家背包**，ADR-013），并把上一轮裁决当**事实**回注（AC-21.5）。
+- `src/lib/quest/bridge.ts`：`applyQuestEvent` / `applyPlayerAccept` / `applyPlayerDecline` ——
+  事件→裁决接线，产出 `QuestRuling` 事实（纯函数）。提案载荷**不含 `npcId`**：出面人由设置注入，模型说了不算。
+- `src/lib/quest/persist.ts`：`normalizeStoredWorld` —— 存档容错，复用领域层 `holdItem` 重建预留锁。
+- `src/components/QuestPanel.tsx`：委托区 UI（复用现有类名，未改 CSS）。
+- `src/types.ts` / `storage.ts` / `settings.ts` / `api.ts` / `store.tsx` / `TaskPanel.tsx` /
+  `SettingsDialog.tsx` / `labels.ts`：对话模式（`npc` 默认 / `desk` 原样）、出面 NPC、`questTools` 标志、
+  三类事件消费、世界持久化、裁决留痕（拒绝绝不静默）、npc 模式跳过抽取通道。
+
+**遗留 / 待办**
+
+- `scripts/render-check.mjs` 在沙箱内跑不了（Vite 用 esbuild 打包配置需 spawn 子进程）：
+  **需在正常终端复跑** `npm run check:render`，它是「一打开就白屏」的唯一自动防线。
+- `store.tsx` 的 React 胶水（send 的事件分支与收尾）没有自动化测试：`node --test` 无法直接导入 `.tsx`，
+  只能靠 typecheck 与 SSR 探针间接覆盖。
+- `World.processed`（幂等记录）与 `World.events`（事件流水）目前**无上限**，会随会话累积进 localStorage。
