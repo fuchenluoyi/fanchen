@@ -39,6 +39,7 @@
 | [005-task-breakdown.md](./005-task-breakdown.md) | 任务拆解、DAG、执行顺序、DoD | 实现者 |
 | [006-test-plan.md](./006-test-plan.md) | 测试策略、用例、冒烟脚本、手工验收 | 实现者/验收者 |
 | [007-decisions.md](./007-decisions.md) | 决策记录（ADR） | 所有人 |
+| [008-npc-quest-domain.md](./008-npc-quest-domain.md) | **NPC 委托领域层**：道具与珍贵等级、背包与预留锁、奖励系统、目标原语、涌现式委托与裁决层 | 实现者 |
 
 ## 3. 当前状态
 
@@ -49,8 +50,11 @@
 | 任务拆解 | ✅ 已完成（T1–T7） |
 | 实现 | ✅ 已完成 |
 | 验收回验 | ✅ 已完成（`pnpm run verify` 全绿；仅需真实 Key 的项见 006 §4 标注 ⚠️） |
+| 第二轮：NPC 委托领域层 | ✅ 已完成（T8，纯领域层；**未接 UI 与 LLM**，见 008 §10） |
 
-**验证快照**：typecheck 零错误 · 单测 40/40 · 冒烟 10/10 · 渲染自检通过 · 产物 gzip 83.6 KB · `pnpm dev` 实测可用。
+**验证快照（第一轮）**：typecheck 零错误 · 单测 40/40 · 冒烟 10/10 · 渲染自检通过 · 产物 gzip 83.6 KB · `pnpm dev` 实测可用。
+
+**验证快照（第二轮 · 本轮实测）**：typecheck 零错误 · 全仓库单测 **92/92**（原有 40 + NPC 委托领域层 52）· `node scripts/quest-smoke.ts` 通过（退出码 0，含 5 条拒绝路径与道具守恒核对）。第一轮的冒烟/渲染自检/产物体积未在本机复跑。
 
 ## 4. 需求 → 任务 → 测试 追溯矩阵
 
@@ -78,3 +82,34 @@
 | NFR-006 安全 | T2 | M-20 |
 | NFR-007 响应式 | T3 | M-21 |
 | NFR-008 单命令启动 | T1, T7 | M-22 |
+
+### 第二轮：NPC 委托系统（任务编号 T8，详见 [008](./008-npc-quest-domain.md)）
+
+| 需求 | 任务 | 测试 |
+| --- | --- | --- |
+| FR-015 道具与珍贵等级 | T8 | U-09 |
+| FR-016 NPC 背包 | T8 | U-10 |
+| FR-017 奖励系统 | T8 | U-12, U-14, U-17 |
+| FR-018 目标原语白名单 | T8 | U-11, U-18 |
+| FR-019 涌现式 NPC 委托 | T8 | U-13, U-19, U-20 |
+| FR-020 裁决层 | T8 | U-15, U-16, U-17 |
+| NFR-009 领域层纯函数零依赖 | T8 | U-09..U-20 |
+| NFR-010 可脱离 LLM 验证 | T8 | S-13 |
+
+**用例编号对照**
+
+| 编号 | 位置 | 覆盖内容 |
+| --- | --- | --- |
+| U-09 | `tests/quest.domain.test.ts` | 道具表自检、五档珍贵等级、价值区间、检索 |
+| U-10 | `tests/quest.domain.test.ts` | 背包增删、预留锁、守恒、只释放指定任务 |
+| U-11 | `tests/quest.domain.test.ts` | 目标原语形状校验、`defeat` 待依赖、`has_item` 判定 |
+| U-12 | `tests/quest.domain.test.ts` | 档位上限、能力限大事、好感度上限、候选奖励 |
+| U-13 | `tests/quest.adjudicate.test.ts` | 发布委托、所求者是 NPC、溯源、预留 |
+| U-14 | `tests/quest.adjudicate.test.ts` | 超档拒绝、自报档位越权、空背包闸门、预留占用 |
+| U-15 | `tests/quest.adjudicate.test.ts` | 幂等重放、requestId 复用拒绝、缺 requestId |
+| U-16 | `tests/quest.adjudicate.test.ts` | 原子性（拒绝后世界逐字节不变）、重放不重复发奖 |
+| U-17 | `tests/quest.adjudicate.test.ts` | 全链路、道具守恒、事件流水、状态收尾 |
+| U-18 | `tests/quest.adjudicate.test.ts` | 非交付型目标、`deliver_forbidden`、`objective_not_met` |
+| U-19 | `tests/quest.adjudicate.test.ts` | 串行任务链、婉拒释放预留、撤销释放预留 |
+| U-20 | `tests/quest.adjudicate.test.ts` | 涌现式内容并存、只读快照 |
+| S-13 | `scripts/quest-smoke.ts` | 命令行跑通全链路 + 5 条拒绝路径 + 守恒核对 |
