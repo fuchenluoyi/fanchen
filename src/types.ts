@@ -1,6 +1,11 @@
 /**
  * 全项目共享类型（ADR-005：状态层是唯一可变更数据的地方）。
  */
+import type { QuestProposalDraft } from './lib/quest/bridge.ts';
+import type { ItemStack } from './lib/quest/types.ts';
+
+/** 对话模式：npc = 扮演 NPC 发布委托；desk = 原有「玩家需求」需求台 */
+export type ChatMode = 'npc' | 'desk';
 
 export type Role = 'system' | 'user' | 'assistant';
 
@@ -73,6 +78,10 @@ export interface Settings {
   historyLimit: number;
   dedupeThreshold: number;
   showReasoning: boolean;
+  /** 对话模式（ADR-013 后续接线：默认 npc，刷新即见委托功能） */
+  chatMode: ChatMode;
+  /** npc 模式下由谁出面发布委托 */
+  questNpcId: string;
 }
 
 export interface HealthInfo {
@@ -107,7 +116,22 @@ export type ServerEvent =
   | { type: 'delta'; text: string }
   | { type: 'reasoning'; text: string }
   | { type: 'tool_call'; index: number; id?: string; task: RawTaskPayload }
+  | { type: 'quest_proposal'; index: number; proposal: QuestProposalDraft }
+  | { type: 'quest_submit'; index: number; submission: QuestSubmissionPayload }
+  | { type: 'quest_decline'; index: number; decline: QuestDeclinePayload }
   | { type: 'notice'; code: string; message: string }
   | { type: 'usage'; usage: Record<string, unknown> }
   | { type: 'done' }
   | { type: 'error'; code: string; message: string };
+
+/* ---------------- 委托工具通道的载荷（契约 §2.3） ---------------- */
+
+export interface QuestSubmissionPayload {
+  questId: string;
+  deliver?: ItemStack;
+}
+
+export interface QuestDeclinePayload {
+  questId: string;
+  reason?: string;
+}

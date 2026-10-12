@@ -24,6 +24,12 @@ import type {
   TaskCandidate,
   TaskStatus,
 } from '../types.ts';
+import type { QuestChannelEvent, QuestRuling } from '../lib/quest/bridge.ts';
+import { applyPlayerAccept, applyPlayerDecline, applyQuestEvent } from '../lib/quest/bridge.ts';
+import { normalizeStoredWorld } from '../lib/quest/persist.ts';
+import { buildNpcSystemPrompt } from '../lib/quest/prompt.ts';
+import type { World } from '../lib/quest/types.ts';
+import { QUEST_ACTION_LABEL } from '../lib/labels.ts';
 import { buildRequestMessages, hasCredentials, loadSettings, normalizeSettings, saveSettings } from '../lib/settings.ts';
 import { STORAGE_KEYS, isArrayOfObjects, loadJson, removeKeys, saveJson } from '../lib/storage.ts';
 import { createId } from '../lib/id.ts';
@@ -41,6 +47,10 @@ interface State {
   tasks: Task[];
   candidates: TaskCandidate[];
   audits: AuditEntry[];
+  /** NPC 委托世界：NPC 背包 / 委托 / 事件流水（npc 模式） */
+  world: World;
+  /** 上一轮系统裁决：作为**事实**回注给模型（AC-21.5），只活在内存里 */
+  lastRuling: QuestRuling | null;
   health: HealthInfo | null;
   healthError: string | null;
   busy: boolean;
@@ -65,6 +75,8 @@ type Action =
   | { type: 'candidates/remove'; payload: string }
   | { type: 'candidates/clear' }
   | { type: 'audit/push'; payload: AuditEntry }
+  | { type: 'world/set'; payload: World }
+  | { type: 'ruling/set'; payload: QuestRuling | null }
   | { type: 'busy/set'; payload: boolean }
   | { type: 'streaming/set'; payload: string | null }
   | { type: 'toast/set'; payload: string | null }
@@ -108,6 +120,22 @@ function normalizeTask(raw: unknown): Task | null {
   };
 }
 
+/** 把一条裁决事实变成审计记录（拒绝绝不静默） */
+function buildQuestAudit(ruling: QuestRuling, messageId: string | null, durationMs: number): AuditEntry {
+  return {
+    id: createId('audit'),
+    at: ruling.at,
+    messageId,
+    triggered: true,
+    reasons: [QUEST_ACTION_LABEL[ruling.action]],
+    channel: 'tool',
+    produced: ruling.ok ? 1 : 0,
+    dropped: ruling.ok ? 0 : 1,
+    durationMs,
+    note: ruling.ok ? `接受：${ruling.message}` : `拒绝（${ruling.code ?? 'unknown'}）：${ruling.message}`,
+  };
+}
+
 function createInitialState(): State {
   const settings = loadSettings();
   const messages = loadJson<ChatMessage[]>(STORAGE_KEYS.messages, [], isArrayOfObjects)
@@ -120,6 +148,8 @@ function createInitialState(): State {
   const tasks = loadJson<unknown[]>(STORAGE_KEYS.tasks, [], isArrayOfObjects)
     .map(normalizeTask)
     .filter((t): t is Task => t !== null);
+  // 世界存档同样走容错归一化：最坏情况回到开局，绝不让脏数据白屏
+  const world = normalizeStoredWorld(loadJson<unknown>(STORAGE_KEYS.quest, null));
 
   return {
     settings,
@@ -127,6 +157,8 @@ function createInitialState(): State {
     tasks,
     candidates: [],
     audits: [],
+    world,
+    lastRuling: null,
     health: null,
     healthError: null,
     busy: false,
@@ -193,6 +225,10 @@ function reducer(state: State, action: Action): State {
       return { ...state, candidates: [] };
     case 'audit/push':
       return { ...state, audits: [action.payload, ...state.audits].slice(0, MAX_AUDITS) };
+    case 'world/set':
+      return { ...state, world: action.payload };
+    case 'ruling/set':
+      return { ...state, lastRuling: action.payload };
     case 'busy/set':
       return { ...state, busy: action.payload };
     case 'streaming/set':
@@ -218,6 +254,10 @@ export interface StoreValue {
   acceptCandidate: (id: string) => void;
   dropCandidate: (id: string) => void;
   acceptAllCandidates: () => void;
+  /** 玩家点【接取】当前 NPC 的委托（走裁决层，不直接改状态） */
+  acceptQuest: (questId: string) => void;
+  /** 玩家点【婉拒】：释放该委托预留的谢礼 */
+  declineQuest: (questId: string, reason?: string) => void;
   setTaskStatus: (id: string, status: TaskStatus) => void;
   removeTask: (id: string) => void;
   clearMessages: () => void;
@@ -249,6 +289,10 @@ export function StoreProvider({ children }: { children: ReactNode }) {
   useEffect(() => {
     saveJson(STORAGE_KEYS.tasks, state.tasks);
   }, [state.tasks]);
+
+  useEffect(() => {
+    saveJson(STORAGE_KEYS.quest, state.world);
+  }, [state.world]);
 
   useEffect(() => {
     saveSettings(state.settings);
@@ -320,10 +364,20 @@ export function StoreProvider({ children }: { children: ReactNode }) {
     let streamError: string | null = null;
     const startedAt = Date.now();
 
+    /* -------------------- npc 模式：世界副本 + 裁决事实 -------------------- */
+    const npcMode = settings.chatMode === 'npc';
+    let worldDraft = current.world;
+    /** 本轮发生的裁决，按时间顺序 */
+    const rulings: QuestRuling[] = [];
+    // 只读真相随之进 prompt：只有 NPC 自己的视角（ADR-013）
+    const systemContent = npcMode
+      ? buildNpcSystemPrompt(worldDraft, settings.questNpcId, current.lastRuling, settings.systemPrompt)
+      : undefined;
+
     try {
       await streamChat({
         settings,
-        messages: buildRequestMessages(settings, history),
+        messages: buildRequestMessages(settings, history, systemContent),
         signal: controller.signal,
         onEvent: (event: ServerEvent) => {
           switch (event.type) {
@@ -344,6 +398,28 @@ export function StoreProvider({ children }: { children: ReactNode }) {
                 assistantMessage.id,
               );
               toolCandidates.push(candidate);
+              break;
+            }
+            case 'quest_proposal':
+            case 'quest_submit':
+            case 'quest_decline': {
+              // desk 模式不会收到这些事件；真收到也不该动世界
+              if (!npcMode) break;
+              const channel: QuestChannelEvent =
+                event.type === 'quest_proposal'
+                  ? { type: 'quest_proposal', proposal: event.proposal }
+                  : event.type === 'quest_submit'
+                    ? { type: 'quest_submit', submission: event.submission }
+                    : { type: 'quest_decline', decline: event.decline };
+              // 模型只提提案，裁决在这里发生；每次一个新幂等键
+              const outcome = applyQuestEvent(worldDraft, channel, {
+                npcId: settings.questNpcId,
+                requestId: createId('req'),
+                dialogueId: assistantMessage.id,
+                now: Date.now(),
+              });
+              worldDraft = outcome.world;
+              rulings.push(outcome.ruling);
               break;
             }
             case 'notice':
@@ -378,6 +454,54 @@ export function StoreProvider({ children }: { children: ReactNode }) {
     });
     dispatch({ type: 'busy/set', payload: false });
     dispatch({ type: 'streaming/set', payload: null });
+
+    /* -------------------- npc 模式收尾：落世界 + 记裁决 -------------------- */
+    if (npcMode) {
+      const durationMs = Date.now() - startedAt;
+      // 记一轮对话：talk_count 目标（以及后续阶段门控）读的就是这个计数。
+      // 这不是裁决规则，只是把"跟这位 NPC 说过几轮话"这个事实记下来。
+      const talkedNpcId = settings.questNpcId;
+      const talks = { ...worldDraft.player.talks };
+      talks[talkedNpcId] = (talks[talkedNpcId] ?? 0) + 1;
+      worldDraft = { ...worldDraft, player: { ...worldDraft.player, talks } };
+
+      if (worldDraft !== current.world) dispatch({ type: 'world/set', payload: worldDraft });
+      const lastRuling = rulings.length > 0 ? rulings[rulings.length - 1] : null;
+      // 无条件写入：裁决事实只回注一轮 —— 本轮没有新裁决就清空，
+      // 免得两轮前那条拒绝被一直当成"刚刚发生"（事实会过期，还白烧一段 token）
+      dispatch({ type: 'ruling/set', payload: lastRuling });
+      // 每一笔裁决都留痕；拒绝绝不静默
+      for (const ruling of rulings) {
+        dispatch({ type: 'audit/push', payload: buildQuestAudit(ruling, assistantMessage.id, durationMs) });
+      }
+      const rejected = rulings.find((ruling) => !ruling.ok);
+      if (rejected) {
+        dispatch({ type: 'toast/set', payload: `系统驳回（${rejected.code ?? 'unknown'}）：${rejected.message}` });
+      } else if (lastRuling) {
+        dispatch({ type: 'toast/set', payload: lastRuling.message });
+      } else if (streamError) {
+        dispatch({
+          type: 'audit/push',
+          payload: {
+            id: createId('audit'),
+            at: Date.now(),
+            messageId: assistantMessage.id,
+            triggered: false,
+            reasons: [],
+            channel: 'none',
+            produced: 0,
+            dropped: 0,
+            durationMs,
+            note: `对话失败：${streamError}`,
+          },
+        });
+        dispatch({ type: 'toast/set', payload: streamError });
+      } else if (notices.length > 0) {
+        dispatch({ type: 'toast/set', payload: notices[0] });
+      }
+      // npc 模式不走需求抽取通道
+      return;
+    }
 
     if (streamError && !assistantText) {
       dispatch({
@@ -475,6 +599,47 @@ export function StoreProvider({ children }: { children: ReactNode }) {
     dispatch({ type: 'candidates/remove', payload: id });
   }, []);
 
+  /* -------------------- NPC 委托：玩家在界面上点头 / 摇头 -------------------- */
+
+  /** 玩家点【接取】：同样走裁决层，不直接改状态 */
+  const acceptQuest = useCallback((questId: string) => {
+    const current = stateRef.current;
+    const outcome = applyPlayerAccept(current.world, {
+      questId,
+      requestId: createId('req'),
+      now: Date.now(),
+    });
+    dispatch({ type: 'world/set', payload: outcome.world });
+    dispatch({ type: 'ruling/set', payload: outcome.ruling });
+    dispatch({ type: 'audit/push', payload: buildQuestAudit(outcome.ruling, null, 0) });
+    dispatch({
+      type: 'toast/set',
+      payload: outcome.ruling.ok
+        ? outcome.ruling.message
+        : `接取失败（${outcome.ruling.code ?? 'unknown'}）：${outcome.ruling.message}`,
+    });
+  }, []);
+
+  /** 玩家点【婉拒】：释放这条委托预留的谢礼 */
+  const declineQuest = useCallback((questId: string, reason?: string) => {
+    const current = stateRef.current;
+    const outcome = applyPlayerDecline(current.world, {
+      questId,
+      requestId: createId('req'),
+      now: Date.now(),
+      ...(reason ? { reason } : {}),
+    });
+    dispatch({ type: 'world/set', payload: outcome.world });
+    dispatch({ type: 'ruling/set', payload: outcome.ruling });
+    dispatch({ type: 'audit/push', payload: buildQuestAudit(outcome.ruling, null, 0) });
+    dispatch({
+      type: 'toast/set',
+      payload: outcome.ruling.ok
+        ? outcome.ruling.message
+        : `婉拒失败（${outcome.ruling.code ?? 'unknown'}）：${outcome.ruling.message}`,
+    });
+  }, []);
+
   const setTaskStatus = useCallback((id: string, status: TaskStatus) => {
     dispatch({ type: 'tasks/status', payload: { id, status } });
   }, []);
@@ -493,7 +658,7 @@ export function StoreProvider({ children }: { children: ReactNode }) {
   }, []);
 
   const resetAll = useCallback(() => {
-    removeKeys([STORAGE_KEYS.settings, STORAGE_KEYS.messages, STORAGE_KEYS.tasks]);
+    removeKeys([STORAGE_KEYS.settings, STORAGE_KEYS.messages, STORAGE_KEYS.tasks, STORAGE_KEYS.quest]);
     dispatch({ type: 'data/reset', payload: normalizeSettings(loadSettings()) });
     dispatch({ type: 'toast/set', payload: '已清空本地数据' });
   }, []);
@@ -547,6 +712,8 @@ export function StoreProvider({ children }: { children: ReactNode }) {
       acceptCandidate,
       dropCandidate,
       acceptAllCandidates,
+      acceptQuest,
+      declineQuest,
       setTaskStatus,
       removeTask,
       clearMessages,
@@ -567,6 +734,8 @@ export function StoreProvider({ children }: { children: ReactNode }) {
       acceptCandidate,
       dropCandidate,
       acceptAllCandidates,
+      acceptQuest,
+      declineQuest,
       setTaskStatus,
       removeTask,
       clearMessages,

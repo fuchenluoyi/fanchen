@@ -2,7 +2,16 @@
  * 与后端代理通信：健康检查、模型列表、流式对话、结构化抽取。
  * 唯一负责网络的地方（架构约束：components 不得直接触网）。
  */
-import type { HealthInfo, RawTaskPayload, Role, ServerEvent, Settings } from '../types.ts';
+import type {
+  HealthInfo,
+  QuestDeclinePayload,
+  QuestSubmissionPayload,
+  RawTaskPayload,
+  Role,
+  ServerEvent,
+  Settings,
+} from '../types.ts';
+import type { QuestProposalDraft } from './quest/bridge.ts';
 
 export class ApiError extends Error {
   readonly code: string;
@@ -51,6 +60,113 @@ export function sanitizeRawTaskPayload(raw: unknown): RawTaskPayload | null {
     acceptance: acceptance.map((x) => x.trim()),
     confidence: Math.min(1, Math.max(0, Number(confidenceRaw.toFixed(2)))),
   };
+}
+
+/* ------------------------------------------------------------------ */
+
+const OBJECTIVE_KINDS = new Set(['deliver_item', 'has_item', 'talk_count', 'affinity_at_least']);
+const REWARD_KINDS = new Set(['item', 'affinity', 'ability', 'info', 'none']);
+
+/**
+ * 客户端侧再校验一次模型给的委托提案（纵深防御，做法同 sanitizeRawTaskPayload）。
+ * 这里只判"形状能不能喂给领域层"：**规则**裁决（道具白名单、档位上限、库存预留）
+ * 由领域层负责，它本身是全函数 —— 非法输入会被拒绝而不是抛出。
+ */
+export function sanitizeQuestProposal(raw: unknown): QuestProposalDraft | null {
+  if (!raw || typeof raw !== 'object') return null;
+  const source = raw as Record<string, unknown>;
+  const title = typeof source.title === 'string' ? source.title.trim() : '';
+  const want = typeof source.want === 'string' ? source.want.trim() : '';
+  const objective = source.objective as Record<string, unknown> | undefined;
+  const reward = source.reward as Record<string, unknown> | undefined;
+  if (!title || !want) return null;
+  if (!objective || typeof objective !== 'object' || !OBJECTIVE_KINDS.has(String(objective.kind))) return null;
+  if (!reward || typeof reward !== 'object' || !REWARD_KINDS.has(String(reward.kind))) return null;
+  const offerLevel = source.offerLevel;
+  return {
+    title: title.slice(0, 40),
+    want: want.slice(0, 300),
+    tier: source.tier as QuestProposalDraft['tier'],
+    objective: objective as unknown as QuestProposalDraft['objective'],
+    reward: reward as unknown as QuestProposalDraft['reward'],
+    ...(offerLevel === 1 || offerLevel === 2 || offerLevel === 3 ? { offerLevel } : {}),
+  };
+}
+
+export function sanitizeQuestSubmission(raw: unknown): QuestSubmissionPayload | null {
+  if (!raw || typeof raw !== 'object') return null;
+  const source = raw as Record<string, unknown>;
+  const questId = typeof source.questId === 'string' ? source.questId.trim() : '';
+  if (!questId) return null;
+  const deliver = source.deliver as Record<string, unknown> | undefined;
+  if (deliver && typeof deliver === 'object') {
+    const itemId = typeof deliver.itemId === 'string' ? deliver.itemId : '';
+    const count = typeof deliver.count === 'number' ? Math.trunc(deliver.count) : 0;
+    if (!itemId || count <= 0) return null;
+    return { questId, deliver: { itemId, count } };
+  }
+  return { questId };
+}
+
+export function sanitizeQuestDecline(raw: unknown): QuestDeclinePayload | null {
+  if (!raw || typeof raw !== 'object') return null;
+  const source = raw as Record<string, unknown>;
+  const questId = typeof source.questId === 'string' ? source.questId.trim() : '';
+  if (!questId) return null;
+  const reason = typeof source.reason === 'string' ? source.reason.slice(0, 100) : '';
+  return reason ? { questId, reason } : { questId };
+}
+
+function eventIndex(value: unknown): number {
+  return typeof value === 'number' && Number.isFinite(value) ? Math.trunc(value) : 0;
+}
+
+/** 把服务端来的原始 JSON 收敛成合法事件；不认识或结构不对的返回 null（丢弃而不是塞给 UI） */
+export function normalizeServerEvent(raw: unknown): ServerEvent | null {
+  if (!raw || typeof raw !== 'object') return null;
+  const source = raw as Record<string, unknown>;
+  switch (source.type) {
+    case 'delta':
+      return typeof source.text === 'string' ? { type: 'delta', text: source.text } : null;
+    case 'reasoning':
+      return typeof source.text === 'string' ? { type: 'reasoning', text: source.text } : null;
+    case 'tool_call': {
+      const task = sanitizeRawTaskPayload(source.task);
+      return task ? { type: 'tool_call', index: eventIndex(source.index), task } : null;
+    }
+    case 'quest_proposal': {
+      const proposal = sanitizeQuestProposal(source.proposal);
+      return proposal ? { type: 'quest_proposal', index: eventIndex(source.index), proposal } : null;
+    }
+    case 'quest_submit': {
+      const submission = sanitizeQuestSubmission(source.submission);
+      return submission ? { type: 'quest_submit', index: eventIndex(source.index), submission } : null;
+    }
+    case 'quest_decline': {
+      const decline = sanitizeQuestDecline(source.decline);
+      return decline ? { type: 'quest_decline', index: eventIndex(source.index), decline } : null;
+    }
+    case 'notice':
+      return {
+        type: 'notice',
+        code: typeof source.code === 'string' ? source.code : 'notice',
+        message: typeof source.message === 'string' ? source.message : '',
+      };
+    case 'usage':
+      return source.usage && typeof source.usage === 'object'
+        ? { type: 'usage', usage: source.usage as Record<string, unknown> }
+        : null;
+    case 'done':
+      return { type: 'done' };
+    case 'error':
+      return {
+        type: 'error',
+        code: typeof source.code === 'string' ? source.code : 'error',
+        message: typeof source.message === 'string' ? source.message : '',
+      };
+    default:
+      return null;
+  }
 }
 
 /* ------------------------------------------------------------------ */
@@ -113,12 +229,15 @@ function parseBlock(block: string, onEvent: (event: ServerEvent) => void): void 
   if (dataLines.length === 0) return;
   const payload = dataLines.join('\n').trim();
   if (!payload || payload === '[DONE]') return;
+  let parsed: unknown;
   try {
-    const parsed = JSON.parse(payload) as ServerEvent;
-    if (parsed && typeof (parsed as { type?: unknown }).type === 'string') onEvent(parsed);
+    parsed = JSON.parse(payload);
   } catch {
     onEvent({ type: 'notice', code: 'malformed_chunk', message: '忽略了服务端一个无法解析的数据块' });
+    return;
   }
+  const event = normalizeServerEvent(parsed);
+  if (event) onEvent(event);
 }
 
 /**
@@ -140,6 +259,8 @@ export async function streamChat(options: StreamChatOptions): Promise<void> {
         temperature: settings.temperature,
         stream: settings.stream,
         enableTools: settings.enableTools,
+        // 只有 npc 模式才把委托工具交给模型；desk 模式的请求体与从前逐字节一致
+        ...(settings.chatMode === 'npc' && settings.enableTools ? { questTools: true } : {}),
         messages,
       }),
       signal,
@@ -162,6 +283,7 @@ export async function streamChat(options: StreamChatOptions): Promise<void> {
       text?: unknown;
       reasoning?: unknown;
       toolCalls?: unknown;
+      questCalls?: unknown;
       notices?: unknown;
       usage?: unknown;
     };
@@ -182,6 +304,17 @@ export async function streamChat(options: StreamChatOptions): Promise<void> {
         if (task) {
           onEvent({ type: 'tool_call', index: typeof call.index === 'number' ? call.index : 0, task });
         }
+      }
+    }
+    if (Array.isArray(data.questCalls)) {
+      for (const call of data.questCalls as Array<{ index?: unknown; event?: unknown }>) {
+        const event = normalizeServerEvent(call?.event);
+        if (!event) continue;
+        onEvent(
+          event.type === 'quest_proposal' || event.type === 'quest_submit' || event.type === 'quest_decline'
+            ? { ...event, index: typeof call.index === 'number' ? call.index : event.index }
+            : event,
+        );
       }
     }
     if (data.usage && typeof data.usage === 'object') onEvent({ type: 'usage', usage: data.usage as Record<string, unknown> });

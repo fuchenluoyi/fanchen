@@ -7,6 +7,8 @@ export const STORAGE_KEYS = {
   settings: 'fanchen.settings.v1',
   messages: 'fanchen.messages.v1',
   tasks: 'fanchen.tasks.v1',
+  /** NPC 委托世界（NPC 背包 / 委托 / 事件流水），见 src/lib/quest/persist.ts */
+  quest: 'fanchen.quest.v1',
 } as const;
 
 function getStore(): Storage | null {

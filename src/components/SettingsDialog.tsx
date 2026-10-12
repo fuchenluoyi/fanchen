@@ -1,7 +1,8 @@
 import { useEffect, useState } from 'react';
 import { useStore } from '../state/store.tsx';
-import { DEFAULT_SETTINGS, DEFAULT_SYSTEM_PROMPT } from '../lib/settings.ts';
-import type { ExtractMode, Settings } from '../types.ts';
+import { DEFAULT_SETTINGS, DEFAULT_SYSTEM_PROMPT, npcPersonaDraft } from '../lib/settings.ts';
+import { NPC_SEEDS } from '../lib/quest/world.ts';
+import type { ChatMode, ExtractMode, Settings } from '../types.ts';
 
 interface Props {
   open: boolean;
@@ -79,6 +80,39 @@ export function SettingsDialog({ open, onClose }: Props) {
 
         <div className="modal__body">
           <section className="form-section">
+            <h3>对话模式</h3>
+            <label className="field">
+              <span>模式</span>
+              <select
+                value={draft.chatMode}
+                onChange={(event) => set('chatMode', event.target.value as ChatMode)}
+              >
+                <option value="npc">NPC 委托：你扮演一位 NPC，它有自己想要的东西，会向你发布委托</option>
+                <option value="desk">需求台：原模式，把对话里的需求登记成任务清单</option>
+              </select>
+              <small>
+                {draft.chatMode === 'npc'
+                  ? '模型会拿到三个提案工具（发布委托 / 交付结算 / 婉拒）与 NPC 自己的背包视角；东西交没交到由系统核对，NPC 说了不算。'
+                  : '原样保留：抽取通道、create_task、候选卡与去重都不变。'}
+              </small>
+            </label>
+
+            {draft.chatMode === 'npc' ? (
+              <label className="field">
+                <span>出面 NPC</span>
+                <select value={draft.questNpcId} onChange={(event) => set('questNpcId', event.target.value)}>
+                  {NPC_SEEDS.map((npc) => (
+                    <option key={npc.id} value={npc.id}>
+                      {npc.name}（{npc.title}）
+                    </option>
+                  ))}
+                </select>
+                <small>每位 NPC 有自己的背包；背包里没有拿得出手的谢礼时，它发不出委托。</small>
+              </label>
+            ) : null}
+          </section>
+
+          <section className="form-section">
             <h3>模型接入（OpenAI 兼容）</h3>
             <label className="field">
               <span>Base URL</span>
@@ -154,7 +188,7 @@ export function SettingsDialog({ open, onClose }: Props) {
                   checked={draft.enableTools}
                   onChange={(e) => set('enableTools', e.target.checked)}
                 />
-                允许模型调用 create_task
+                {draft.chatMode === 'npc' ? '允许模型调用提案工具' : '允许模型调用 create_task'}
               </label>
               <label>
                 <input
@@ -169,6 +203,11 @@ export function SettingsDialog({ open, onClose }: Props) {
 
           <section className="form-section">
             <h3>需求抽取</h3>
+            {draft.chatMode === 'npc' ? (
+              <div className="notice notice--info">
+                npc 模式下不走需求抽取通道，这一节的设置只在「需求台」模式生效。
+              </div>
+            ) : null}
             <label className="field">
               <span>抽取策略</span>
               <select
@@ -222,22 +261,29 @@ export function SettingsDialog({ open, onClose }: Props) {
           </section>
 
           <section className="form-section">
-            <h3>角色人格</h3>
+            <h3>{draft.chatMode === 'npc' ? '人格补充' : '角色人格'}</h3>
             <label className="field">
-              <span>System Prompt</span>
+              <span>{draft.chatMode === 'npc' ? '人格补充（可选）' : 'System Prompt'}</span>
               <textarea
                 rows={8}
-                value={draft.systemPrompt}
+                // 框里显示什么 = 会不会真的被追加：判据走 npcPersonaDraft（内部就是生效规则 isCustomPersona），
+                // 所以老用户存着的默认「说书人」人格不会显示成一框"看似生效其实被跳过"的文字
+                value={draft.chatMode === 'npc' ? npcPersonaDraft(draft.systemPrompt) : draft.systemPrompt}
                 onChange={(event) => set('systemPrompt', event.target.value)}
               />
+              <small>
+                {draft.chatMode === 'npc'
+                  ? '框里显示什么，就会被真的追加什么：留空 = 只用内置的 NPC 框架；一旦手写内容，就作为「额外人格补充」追加进去（旧的默认人格不会被带进 npc 模式）。'
+                  : '整段直接作为 system 提示词发给模型。'}
+              </small>
             </label>
             <div className="field field--inline">
               <button
                 type="button"
                 className="btn btn--ghost btn--sm"
-                onClick={() => set('systemPrompt', DEFAULT_SYSTEM_PROMPT)}
+                onClick={() => set('systemPrompt', draft.chatMode === 'npc' ? '' : DEFAULT_SYSTEM_PROMPT)}
               >
-                恢复默认人格
+                {draft.chatMode === 'npc' ? '清空人格补充' : '恢复默认人格'}
               </button>
               <button type="button" className="btn btn--ghost btn--sm" onClick={() => setDraft(DEFAULT_SETTINGS)}>
                 恢复全部默认值

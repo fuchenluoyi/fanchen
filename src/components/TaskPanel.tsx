@@ -1,6 +1,7 @@
 import { useMemo, useState } from 'react';
 import { useStore } from '../state/store.tsx';
 import { CandidateCard } from './CandidateCard.tsx';
+import { QuestPanel } from './QuestPanel.tsx';
 import { TaskItem } from './TaskItem.tsx';
 import { CHANNEL_LABEL, formatTime } from '../lib/labels.ts';
 import type { TaskStatus } from '../types.ts';
@@ -69,6 +70,9 @@ export function TaskPanel() {
         </div>
       </div>
 
+      {/* npc 模式：委托区在最上面（刷新即见） */}
+      {state.settings.chatMode === 'npc' ? <QuestPanel /> : null}
+
       {state.candidates.length > 0 ? (
         <div className="task-panel__candidates">
           <div className="task-panel__candidates-head">
@@ -90,7 +94,9 @@ export function TaskPanel() {
         {visibleTasks.length === 0 ? (
           <p className="empty-hint empty-hint--small">
             {state.tasks.length === 0
-              ? '还没有任务。当凡尘的话里出现需求时，这里会自动冒出任务卡。'
+              ? state.settings.chatMode === 'npc'
+                ? '需求清单在这里是空的 —— 现在跑的是 NPC 委托模式，往上看「NPC 委托」区。'
+                : '还没有任务。当凡尘的话里出现需求时，这里会自动冒出任务卡。'
               : '该状态下没有任务。'}
           </p>
         ) : (
