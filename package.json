@@ -15,6 +15,7 @@
     "test": "node --test \"tests/**/*.test.ts\"",
     "check:render": "node scripts/render-check.mjs",
     "smoke": "node scripts/smoke.mjs",
+    "smoke:quest": "node scripts/quest-smoke.ts",
     "verify": "node node_modules/typescript/bin/tsc --noEmit -p tsconfig.json && node --test \"tests/**/*.test.ts\" && node node_modules/vite/bin/vite.js build && node scripts/render-check.mjs && node scripts/smoke.mjs"
   },
   "engines": {
