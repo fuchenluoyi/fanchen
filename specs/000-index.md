@@ -53,6 +53,7 @@
 | 第二轮：NPC 委托领域层 | ✅ 已完成（T8，纯领域层，见 008） |
 | 第三轮：委托工具通道 | ✅ 服务端已完成（T9，见 008 §12） |
 | 第四轮：前端接入界面 | ✅ 已完成（T10；`npc` 模式为默认，`desk` 模式原样保留） |
+| 第五轮：交付动作 / 独立会话 / 道具与关系阶段 / 印象 | ✅ 已完成（T11，见 008 §12） |
 
 **验证快照（第一轮）**：typecheck 零错误 · 单测 40/40 · 冒烟 10/10 · 渲染自检通过 · 产物 gzip 83.6 KB · `pnpm dev` 实测可用。
 
@@ -62,6 +63,9 @@
 
 **验证快照（第四轮 · 本轮实测）**：typecheck 零错误 · 全仓库单测 **134/134**（新增 `tests/quest.frontend.test.ts` 28 例）· `quest-smoke` 通过 · 项目自带 `scripts/smoke.mjs` **10/10 通过**（确认既有链路未被破坏）· 工作区无残留。
 ⚠️ `scripts/render-check.mjs` 无法在本机沙箱内运行（Vite 需 spawn 子进程），**待在执行者终端复跑** `npm run check:render`。
+
+**验证快照（第五轮 · 本轮实测）**：typecheck 零错误 · 全仓库单测 **183/183**（11 个文件：`dedupe` 8 · `extract` 8 · `rules` 6 · `server` 18 · `quest.domain` 37 · `quest.adjudicate` 24 · `quest.tools` 18 · `quest.relationship` 7 · `quest.impression` 11 · `quest.frontend` 41 · `threads` 5）· `node scripts/quest-smoke.ts` 通过（退出码 0）· `scripts/smoke.mjs` **10/10 通过** · 工作区无残留。
+⚠️ 遗留：`render-check` 仍需在正常终端复跑（同第四轮）。
 
 ## 4. 需求 → 任务 → 测试 追溯矩阵
 
@@ -110,9 +114,9 @@
 | U-09 | `tests/quest.domain.test.ts` | 道具表自检、五档珍贵等级、价值区间、检索 |
 | U-10 | `tests/quest.domain.test.ts` | 背包增删、预留锁、守恒、只释放指定任务 |
 | U-11 | `tests/quest.domain.test.ts` | 目标原语形状校验、`defeat` 待依赖、`has_item` 判定 |
-| U-12 | `tests/quest.domain.test.ts` | 档位上限、能力限大事、好感度上限、候选奖励 |
+| U-12 | `tests/quest.domain.test.ts` | 道具**不**按价值设上限（背包即上限）、能力限大事、好感度档位上限、候选奖励 |
 | U-13 | `tests/quest.adjudicate.test.ts` | 发布委托、所求者是 NPC、溯源、预留 |
-| U-14 | `tests/quest.adjudicate.test.ts` | 超档拒绝、自报档位越权、空背包闸门、预留占用 |
+| U-14 | `tests/quest.adjudicate.test.ts` | 小事也能给贵重谢礼（无价值上限 + 守恒）、档位由代码算、空背包闸门、预留占用 |
 | U-15 | `tests/quest.adjudicate.test.ts` | 幂等重放、requestId 复用拒绝、缺 requestId |
 | U-16 | `tests/quest.adjudicate.test.ts` | 原子性（拒绝后世界逐字节不变）、重放不重复发奖 |
 | U-17 | `tests/quest.adjudicate.test.ts` | 全链路、道具守恒、事件流水、状态收尾 |
@@ -142,3 +146,18 @@
 | 编号 | 位置 | 覆盖内容 |
 | --- | --- | --- |
 | U-22 | `tests/quest.frontend.test.ts` | 只读真相只含 NPC 自身视角（**断言不含玩家背包**）、道具白名单分组、上一轮裁决事实回注、提案 `npcId` 不由模型决定、事件→裁决接线、存档容错归一化 |
+
+### 第五轮：交付动作 / 独立会话 / 道具与关系阶段 / 印象（任务编号 T11，见 [008 §12](./008-npc-quest-domain.md)）
+
+| 需求 | 任务 | 测试 |
+| --- | --- | --- |
+| FR-023 关系阶段（五档，单向） | T11 | U-23 |
+| FR-024 印象与好感度 | T11 | U-24 |
+| FR-025 主观估值只做叙事 | T11 | U-25 |
+| NFR-013 叙事与裁决的边界 | T11 | U-23, U-24, U-25（边界断言） |
+
+| 编号 | 位置 | 覆盖内容 |
+| --- | --- | --- |
+| U-23 | `tests/quest.relationship.test.ts` | 五档阈值（0/5/15/30/60）、脏值容错、单向不回落、阶段进度、态度文案、**阶段不做硬门闩** |
+| U-24 | `tests/quest.impression.test.ts` | 印象计分（+2/0/−1）、冷却（2 轮，冒犯豁免）、好感度下限、幂等、原子性、事件流水，以及客户端接线与 `sanitizeQuestImpression` |
+| U-25 | `tests/quest.domain.test.ts` + `tests/threads.test.ts` | 主观估值推导（×3 / ×1 / ×0.5）、两张清单从背包推出、**只做叙事不做驳回**；每 NPC 一条独立会话的线索切分（互不污染、旧存档归需求台） |

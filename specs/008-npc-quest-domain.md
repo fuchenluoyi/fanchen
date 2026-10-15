@@ -103,13 +103,17 @@
 
 ```ts
 proposeQuest(world, { requestId, npcId, title, want, tier, objective, reward,
-                      offerLevel?, sourceDialogueId?, draftedBy?, now? })  // 发布
+                      sourceDialogueId?, draftedBy?, now? })                 // 发布（档位由代码算）
 acceptQuest(world,  { requestId, questId, now? })                          // 接取
 submitQuest(world,  { requestId, questId, deliver?: ItemStack, now? })     // 提交并结算
 declineQuest(world, { requestId, questId, reason?, now? })                 // 婉拒（释放预留）
 cancelQuest(world,  { requestId, questId, reason?, now? })                 // 撤销（释放预留）
 expireQuest(world,  { requestId, questId, reason?, now? })                 // 过期（释放预留）
+noteImpression(world, { requestId, npcId, impression, reason?, now? })     // 记印象（好感度的涨法）
 ```
+
+`noteImpression` 是第五轮**新增**的操作，不改变前六个的语义：它不产生委托
+（`Applied.quest` 恒为 `null`），只动 `player.affinity` / `player.stagePeak` / `player.impressionGainAt` 与事件流水。
 
 返回：成功 `{ ok:true, world, quest, replay, applied[] }`；拒绝 `{ ok:false, world, code, message, quest }`。
 `world` 是**新世界**（入参不被修改）；拒绝时 `world` 与入参是同一个引用。
@@ -123,13 +127,12 @@ expireQuest(world,  { requestId, questId, reason?, now? })                 // �
 | `unknown_item` | 目标或奖励引用了未登记的道具 |
 | `unknown_ability` | 奖励引用了未登记的能力 |
 | `invalid_tier` | 任务重要性不是 1 / 2 / 3 |
-| `invalid_offer_level` | 档位不是 1 / 2 / 3 |
 | `idempotency_key_reused` | 同一 `requestId` 换了参数复用 |
 | `invalid_objective` | 目标形状不合法（数量非正整数、缺 targetId 等） |
 | `unsupported_objective` | 原语依赖尚不存在的系统（`defeat`） |
 | `invalid_reward` | 奖励形状不合法（数量非正、情报主题为空或过长） |
-| `reward_not_owned` | NPC 背包里根本没有这件奖励道具 |
-| `reward_over_cap` | 奖励超过档位上限；或自报档位超过代码上限；或能力奖励出现在非"大事"上 |
+| `reward_not_owned` | NPC 背包里根本没有这件奖励道具（**道具奖励的唯一价值性约束**） |
+| `reward_over_cap` | 奖励超过档位上限：**好感度**超档，或**能力**出现在非"大事"上（道具不设价值上限，见 ADR-014） |
 | `npc_reward_unavailable` | 该奖励已被其他任务预留，当前可用不足 |
 | `npc_has_open_quest` | 该 NPC 已有未完结委托（串行任务链） |
 | `self_loop_objective_reward` | 任务所要之物与奖励是同一件（自循环套利） |
@@ -144,9 +147,11 @@ expireQuest(world,  { requestId, questId, reason?, now? })                 // �
 | `player_item_insufficient` | 玩家背包里这件道具不够 |
 | `objective_not_met` | 非交付型目标尚未达成 |
 | `insufficient_items` | 背包层通用库存不足（防御性兜底） |
+| `invalid_impression` | 印象不是 `pleased` / `neutral` / `offended` |
+| `impression_cooldown` | 同一 NPC 每 2 轮最多因印象涨一次（`offended` 不受此限） |
 
 **校验顺序**（固定，便于预期错误码）：先校验请求自身的合法性
-（字段 → 目标 → 档位 → 奖励 → 自循环），再看世界状态（串行链 → 库存预留）。
+（字段 → 目标 → 奖励（档位由代码算出后参与裁决）→ 自循环），再看世界状态（串行链 → 库存预留）。
 
 ## 8. 四条纪律
 
@@ -188,36 +193,77 @@ offered ──accept──▶ accepted ──submit──▶ settled
 | 全仓库单测 | 92 / 92（原有 40 + 本轮 52） |
 | `node scripts/quest-smoke.ts` | 通过（退出码 0，含 5 条拒绝路径与守恒核对） |
 
-## 12. 工具通道与前端接入（T9 + T10）
+## 12. 完整链路（T9 工具通道 + T10 前端接入 + T11 交付动作 / 独立会话 / 道具与主观估值 / 关系阶段与印象）
 
-**已完成（服务端）**
+**工具通道（服务端 · T9 + T11）**
 
-- `server/lib/quest-tools.mjs`：三个提案型工具的定义（`propose_quest` / `submit_quest` / `decline_quest`）
-  与参数归一化。模型给的是扁平参数，这里收敛成领域层要的 `{ title, want, tier, objective, reward, offerLevel? }`。
-- `server/index.mjs`：请求体带 `questTools: true` 时把这三个工具一并交给模型，并把工具调用映射成
-  `quest_proposal` / `quest_submit` / `quest_decline` 三类 SSE 事件（非流式走 `questCalls` 数组）；
+- `server/lib/quest-tools.mjs`：**四个**提案型工具的定义
+  （`propose_quest` / `submit_quest` / `decline_quest` / `note_impression`）与参数归一化。
+  模型给的是扁平参数，这里收敛成领域层要的形状 `{ title, want, tier, objective, reward }` ——
+  **档位不在载荷里**，由领域层按「事情轻重 × 慷慨度」算（`offer_level` 已从参数与归一化里彻底移除，见 ADR-014）。
+- `server/index.mjs`：请求体带 `questTools: true` 时把这四个工具一并交给模型，并把工具调用映射成
+  `quest_proposal` / `quest_submit` / `quest_decline` / `quest_impression` 四类 SSE 事件（非流式走 `questCalls` 数组）；
   归一化失败发 `notice`（`quest_call_rejected`）。不带该字段时行为与从前完全一致。
-- 契约见 [004 §2.3](./004-api-contract.md)，决策见 [ADR-013](./007-decisions.md)。
+- 契约见 [004 §2.3](./004-api-contract.md)，决策见 [ADR-013](./007-decisions.md) / [ADR-014](./007-decisions.md)。
 
-**验证**：`tests/quest.tools.test.ts` 14 例通过；另做过一次进程内端到端验证
+**验证**：`tests/quest.tools.test.ts` 18 例通过；另做过一次进程内端到端验证
 （模拟上游分三片吐 `tool_calls` + 真起后端，流式 / 未开启 / 非流式三条路径全通），验证脚本跑完即删。
 
-**已完成（前端接入 · T10）**
+**前端接入（T10）**
 
 - `src/lib/quest/prompt.ts`：`buildNpcSystemPrompt(world, npcId, lastRuling, customPersona)` ——
   只注入 NPC 自身视角（**不含玩家背包**，ADR-013），并把上一轮裁决当**事实**回注（AC-21.5）。
-- `src/lib/quest/bridge.ts`：`applyQuestEvent` / `applyPlayerAccept` / `applyPlayerDecline` ——
-  事件→裁决接线，产出 `QuestRuling` 事实（纯函数）。提案载荷**不含 `npcId`**：出面人由设置注入，模型说了不算。
-- `src/lib/quest/persist.ts`：`normalizeStoredWorld` —— 存档容错，复用领域层 `holdItem` 重建预留锁。
+- `src/lib/quest/bridge.ts`：`applyQuestEvent` / `applyPlayerAccept` / `applyPlayerDecline` /
+  `applyPlayerSubmit` / `applyQuestImpression` —— 事件与玩家操作→裁决接线，产出 `QuestRuling` 事实（纯函数）。
+  提案载荷**不含 `npcId`**：出面人由设置注入，模型说了不算。
+- `src/lib/quest/persist.ts`：`normalizeStoredWorld` —— 存档容错，复用领域层 `holdItem` 重建预留锁；
+  关系峰值（`stagePeak`）与印象冷却记账（`impressionGainAt`）一并恢复，脏值不制造假冷却。
 - `src/components/QuestPanel.tsx`：委托区 UI（复用现有类名，未改 CSS）。
 - `src/types.ts` / `storage.ts` / `settings.ts` / `api.ts` / `store.tsx` / `TaskPanel.tsx` /
   `SettingsDialog.tsx` / `labels.ts`：对话模式（`npc` 默认 / `desk` 原样）、出面 NPC、`questTools` 标志、
-  三类事件消费、世界持久化、裁决留痕（拒绝绝不静默）、npc 模式跳过抽取通道。
+  四类事件消费、世界持久化、裁决留痕（拒绝绝不静默）、npc 模式跳过抽取通道。
+
+**交付动作（T11）**
+
+- `bridge.applyPlayerSubmit(world, { questId, requestId, now, deliver? })`：玩家在界面上点完成动作，**必须走裁决层**。
+- `store.deliverQuest(questId, deliver?)`：裁决 → 世界落库 → 裁决事实 → 审计 → 轻提示
+  （拒绝用玩家侧文案「你身上没有这件东西（或不够）：…」，**拒绝绝不静默**）。
+- `QuestPanel`：`accepted` 状态给出**显式完成动作** —— 交付型按钮带目标道具与数量（如「交付 三七×1」），
+  非交付型为「请对方验看」；旁边显示玩家**自己**的持有量（读 `player.inventory`，是玩家视角，不违反 ADR-013），
+  不足时给警示样式但**仍可点** —— 界面不替裁决层做判断，拒绝由裁决层给出并回注（AC-21.5）。
+- 其他状态（`offered` / `settled` / `declined` / `cancelled` / `expired`）不显示该按钮。
+
+**每 NPC 一条独立会话（T11）**
+
+- `src/lib/threads.ts`（纯函数，可单测）：`DESK_THREAD_ID` / `threadIdFor` / `normalizeThreadId` /
+  `messagesOfThread` / `threadMessageCounts`。
+- `ChatMessage.npcId`：每条消息记住自己属于哪条线索；**旧存档没有该字段的消息一律归 `'desk'`**（避免第一轮串戏）。
+- `send()` 只把**当前线索**的历史发给模型（否则切到别人后两个人格会糊在一起）；消息列表只渲染当前线索；
+  切回某位时之前的对话原样还在（互不污染、不丢数据）。
+- 对话区顶栏显示「正在与 苏晚照 · 药庐女医 交谈」+ NPC 切换下拉 + 「关系 知交」轻进度；切换即切会话。
+- `clearMessages` 只清**当前线索**；「重置全部」仍清一切。
+
+**道具与主观估值（T11）**
+
+- 道具表 **32 件**（凡 7 / 良 7 / 上 7 / 珍 6 / 绝 5），每件带 `uses` 用途标签（12 词词表）；
+  既有 id 与定价未动（FR-015）。
+- `wantsUses` / `spares` / `likes` / `dislikes` → 主观估值 ×3 / ×0.5 / ×1（`spares` 优先），
+  **只进提示词与展示**（"我舍不得给的：三七、当归…"），**绝不作为驳回依据**（ADR-016、FR-025）。
+
+**关系阶段与印象（T11）**
+
+- `src/lib/quest/relationship.ts`：五档（萍水 / 相识 / 知交 / 知己 / 莫逆，阈值 0/5/15/30/60）、
+  `describeAttitude`（说话分寸）、`progressToNextStage`（界面进度）；`player.stagePeak` 保证**单向不回落**。
+- `noteImpression`：`pleased` +2 / `neutral` 0 / `offended` −1；每 2 轮最多涨一次（**`offended` 豁免**）；
+  好感度 clamp ≥0；幂等；事件 `impression_noted`。客户端**每轮只认第一条**，重复调用记入审计。
+- 阶段与主观估值都**不做硬门闩**（NFR-013）：能不能说交给提示词（态度），能不能给交给守恒类约束（库存/预留）。
 
 **遗留 / 待办**
 
 - `scripts/render-check.mjs` 在沙箱内跑不了（Vite 用 esbuild 打包配置需 spawn 子进程）：
   **需在正常终端复跑** `npm run check:render`，它是「一打开就白屏」的唯一自动防线。
-- `store.tsx` 的 React 胶水（send 的事件分支与收尾）没有自动化测试：`node --test` 无法直接导入 `.tsx`，
-  只能靠 typecheck 与 SSR 探针间接覆盖。
+- `store.tsx` 的 React 胶水（`send` 的事件分支与收尾、印象「每轮只认第一条」、`deliverQuest` 的 dispatch 序列）
+  没有自动化测试：`node --test` 无法直接导入 `.tsx`，只能靠 typecheck 与 SSR 探针间接覆盖。
 - `World.processed`（幂等记录）与 `World.events`（事件流水）目前**无上限**，会随会话累积进 localStorage。
+- 委托面板的 NPC 背包默认折叠，SSR 探针点不开 → 面板里「舍不得给 / 多余」两个徽记
+  只有数据层单测 + 代码复核，**无渲染级覆盖**。

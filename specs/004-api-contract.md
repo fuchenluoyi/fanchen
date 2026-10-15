@@ -124,21 +124,29 @@ Base：开发环境 `http://localhost:8787`（Vite 会把 `/api/*` 代理过来�
 
 ### 2.3 委托工具通道（可选，`questTools: true`）
 
-请求体带上 `"questTools": true` 时，服务端在 `create_task` 之外再暴露三个**提案型**工具
-（`propose_quest` / `submit_quest` / `decline_quest`，定义见 `server/lib/quest-tools.mjs`）；
-不带该字段时行为与从前完全一致。
+请求体带上 `"questTools": true` 时，服务端在 `create_task` 之外再暴露四个**提案型**工具
+（`propose_quest` / `submit_quest` / `decline_quest` / `note_impression`，定义见 `server/lib/quest-tools.mjs`）；
+不带该字段时行为与从前完全一致。四个工具**全是提案**，没有一个能直接改世界。
+
+| 工具 | 参数 | 说明 |
+| --- | --- | --- |
+| `propose_quest` | `{ title, want, tier, objective_kind, objective_item_id?, objective_count?, objective_rounds?, objective_value?, reward_kind, reward_item_id?, reward_count?, reward_affinity?, reward_ability?, reward_topic? }` | NPC 提议发布一条委托。**不再接受 `offer_level`**：奖励档位由代码按「事情轻重（`tier`）× 慷慨度（`generosity`）」算出（`maxOfferLevel`）—— 让模型自报档位正是上一轮翻车的源头，现已从参数与归一化里彻底移除 |
+| `submit_quest` | `{ quest_id, item_id?, count? }` | 模型识别到"玩家把东西交给你"，请求系统核验并结算（是否真的交到，由代码核对，模型无权决定） |
+| `decline_quest` | `{ quest_id, reason? }` | 玩家表示不接这条委托 |
+| `note_impression` | `{ impression, reason? }` | NPC 觉得"这话说到心坎里 / 冒犯了她"，请求系统记账。`impression` 取 `pleased` / `neutral` / `offended`；计分与冷却见 FR-024 |
 
 | SSE 事件 | 载荷 | 含义 |
 | --- | --- | --- |
-| `quest_proposal` | `{ index, proposal }` | NPC 提议发布一条委托；`proposal` 已归一化为领域层输入：`{ title, want, tier, objective, reward, offerLevel? }` |
+| `quest_proposal` | `{ index, proposal }` | NPC 提议发布一条委托；`proposal` 已归一化为领域层输入：`{ title, want, tier, objective, reward }`（档位不在载荷里，由领域层自己算） |
 | `quest_submit` | `{ index, submission }` | 模型识别到"玩家把东西交给你"，请求系统核验并结算：`{ questId, deliver? }` |
 | `quest_decline` | `{ index, decline }` | 玩家表示不接这条委托：`{ questId, reason? }` |
+| `quest_impression` | `{ index, impression }` | NPC 觉得"这话说到心坎里 / 冒犯了她"，请求系统记账：`impression = { kind: 'pleased' \| 'neutral' \| 'offended', reason? }` |
 
 归一化失败（缺字段、枚举不对、类型错）**不发**上述事件，改发一条 `notice`：
 `code = "quest_call_rejected"`，`message` 带可读原因。
 
 **职责边界（ADR-013）**：服务端只做**形状**归一化（枚举、必填、类型）；
-**规则**裁决（道具白名单、奖励档位、库存预留、幂等、守恒）全部在前端领域层 `src/lib/quest/` 完成 ——
+**规则**裁决（道具白名单、库存预留、奖励档位、好感度上限、印象冷却、幂等、守恒）全部在前端领域层 `src/lib/quest/` 完成 ——
 服务端不复制那套规则，也不持有世界状态。
 
 ---
