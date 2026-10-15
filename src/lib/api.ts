@@ -5,6 +5,7 @@
 import type {
   HealthInfo,
   QuestDeclinePayload,
+  QuestImpressionPayload,
   QuestSubmissionPayload,
   RawTaskPayload,
   Role,
@@ -82,15 +83,28 @@ export function sanitizeQuestProposal(raw: unknown): QuestProposalDraft | null {
   if (!title || !want) return null;
   if (!objective || typeof objective !== 'object' || !OBJECTIVE_KINDS.has(String(objective.kind))) return null;
   if (!reward || typeof reward !== 'object' || !REWARD_KINDS.has(String(reward.kind))) return null;
-  const offerLevel = source.offerLevel;
+  // 档位由代码算，模型不再自报 —— 这里也不接受 offerLevel
   return {
     title: title.slice(0, 40),
     want: want.slice(0, 300),
     tier: source.tier as QuestProposalDraft['tier'],
     objective: objective as unknown as QuestProposalDraft['objective'],
     reward: reward as unknown as QuestProposalDraft['reward'],
-    ...(offerLevel === 1 || offerLevel === 2 || offerLevel === 3 ? { offerLevel } : {}),
   };
+}
+
+const IMPRESSION_KINDS = new Set(['pleased', 'neutral', 'offended']);
+
+/** 印象事件（note_impression）的客户端侧收敛 */
+export function sanitizeQuestImpression(raw: unknown): QuestImpressionPayload | null {
+  if (!raw || typeof raw !== 'object') return null;
+  const source = raw as Record<string, unknown>;
+  const kind = typeof source.kind === 'string' ? source.kind.trim() : '';
+  if (!IMPRESSION_KINDS.has(kind)) return null;
+  const reason = typeof source.reason === 'string' ? source.reason.trim().slice(0, 200) : '';
+  return reason
+    ? { kind: kind as QuestImpressionPayload['kind'], reason }
+    : { kind: kind as QuestImpressionPayload['kind'] };
 }
 
 export function sanitizeQuestSubmission(raw: unknown): QuestSubmissionPayload | null {
@@ -145,6 +159,12 @@ export function normalizeServerEvent(raw: unknown): ServerEvent | null {
     case 'quest_decline': {
       const decline = sanitizeQuestDecline(source.decline);
       return decline ? { type: 'quest_decline', index: eventIndex(source.index), decline } : null;
+    }
+    case 'quest_impression': {
+      const impression = sanitizeQuestImpression(source.impression);
+      return impression
+        ? { type: 'quest_impression', index: eventIndex(source.index), impression }
+        : null;
     }
     case 'notice':
       return {
@@ -311,7 +331,10 @@ export async function streamChat(options: StreamChatOptions): Promise<void> {
         const event = normalizeServerEvent(call?.event);
         if (!event) continue;
         onEvent(
-          event.type === 'quest_proposal' || event.type === 'quest_submit' || event.type === 'quest_decline'
+          event.type === 'quest_proposal' ||
+            event.type === 'quest_submit' ||
+            event.type === 'quest_decline' ||
+            event.type === 'quest_impression'
             ? { ...event, index: typeof call.index === 'number' ? call.index : event.index }
             : event,
         );

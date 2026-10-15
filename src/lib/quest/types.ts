@@ -35,6 +35,12 @@ export interface ItemDef {
   description: string;
   /** 检索标签，供模型消歧与目标原语匹配 */
   tags: readonly string[];
+  /**
+   * 用途标签（比 tags 细一档）：疗伤 / 补血 / 调和 / 滋补 / 提神 / 吃食 /
+   * 器具 / 凭据 / 兵器 / 材料 / 信物 / 传信。NPC 的 `wantsUses` 靠它匹配，
+   * 推出「她舍不得给 / 她多余的」—— 那只进叙事与展示。
+   */
+  uses: readonly string[];
 }
 
 export interface ItemStack {
@@ -76,10 +82,18 @@ export interface NpcDef {
   name: string;
   title: string;
   /**
-   * 慷慨度 0..1 —— 本轮只用到这一个性格参数，用来裁决奖励档位上限。
+   * 慷慨度 0..1 —— 用来裁决奖励档位（好感度上限、能力是否可在这一档出现）。
    * honesty / openness 留给后续（狡诈 NPC 与阶段门控）。
    */
   generosity: number;
+  /** 她在意的用途标签：命中则主观估值 ×3（舍不得给） */
+  wantsUses: readonly string[];
+  /** 她明确觉得多余的道具 id：命中则 ×0.5（拿出去换正好）；优先于 wantsUses */
+  spares: readonly string[];
+  /** 自然语言喜好，直接写进提示词 */
+  likes: readonly string[];
+  /** 自然语言忌讳，直接写进提示词 */
+  dislikes: readonly string[];
   inventory: readonly ItemStack[];
 }
 
@@ -88,6 +102,10 @@ export interface NpcState {
   name: string;
   title: string;
   generosity: number;
+  wantsUses: string[];
+  spares: string[];
+  likes: string[];
+  dislikes: string[];
   inventory: Inventory;
 }
 
@@ -97,6 +115,13 @@ export interface PlayerState {
   inventory: Inventory;
   /** 每个 NPC 一条好感度 */
   affinity: Record<string, number>;
+  /**
+   * 历史最高关系阶段索引（单向不回落）：好感度掉了也不降阶。
+   * 见 relationship.ts 的 stageIndexOf。
+   */
+  stagePeak: Record<string, number>;
+  /** 上一次因印象拿到好感度时的对话轮数（冷却用），见 IMPRESSION_COOLDOWN_ROUNDS */
+  impressionGainAt: Record<string, number>;
   /** 已解锁的功能（布尔锁，不会耗尽） */
   abilities: AbilityId[];
   /** 已获得的情报 */
@@ -104,6 +129,9 @@ export interface PlayerState {
   /** 每个 NPC 的累计对话轮数（talk_count 原语与阶段门控用） */
   talks: Record<string, number>;
 }
+
+/** 印象：模型对「这一轮说到心坎里 / 冒犯了她」的判断（好感度的涨法） */
+export type ImpressionKind = 'pleased' | 'neutral' | 'offended';
 
 /* =============================== 奖励 =============================== */
 
@@ -214,13 +242,15 @@ export type QuestEventType =
   | 'items_delivered'
   | 'reward_granted'
   | 'reward_released'
-  | 'quest_settled';
+  | 'quest_settled'
+  | 'impression_noted';
 
 export interface QuestEvent {
   id: string;
   at: number;
   type: QuestEventType;
-  questId: string;
+  /** 印象类事件不属于任何委托，此时为 null */
+  questId: string | null;
   npcId: string;
   detail: string;
 }
@@ -252,7 +282,6 @@ export type QuestErrorCode =
   | 'unknown_item'
   | 'unknown_ability'
   | 'invalid_tier'
-  | 'invalid_offer_level'
   | 'idempotency_key_reused'
   | 'invalid_objective'
   | 'unsupported_objective'
@@ -272,7 +301,9 @@ export type QuestErrorCode =
   | 'deliver_count_too_low'
   | 'player_item_insufficient'
   | 'objective_not_met'
-  | 'insufficient_items';
+  | 'insufficient_items'
+  | 'invalid_impression'
+  | 'impression_cooldown';
 
 /** 领域错误：只带拒绝码与面向人的说明，不带栈语义 */
 export class QuestError extends Error {

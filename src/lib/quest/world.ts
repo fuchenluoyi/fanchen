@@ -11,6 +11,7 @@
 import { getItem } from './items.ts';
 import { availableOf, createInventory, listAvailable, listHolds, totalOf } from './inventory.ts';
 import type {
+  ItemDef,
   ItemStack,
   NpcDef,
   NpcState,
@@ -24,20 +25,34 @@ import type {
 
 export const DEFAULT_PLAYER_ID = 'player';
 
-/** NPC 种子数据：背包就是奖励池，也是「发不出奖励就不触发任务」的天然闸门 */
+/**
+ * NPC 种子数据：背包就是奖励池，也是「发不出奖励就不触发任务」的天然闸门。
+ *
+ * 每位 NPC 都写了「她在意的用途」与「她多余的」：
+ *   wantsUses —— 命中则主观估值 ×3（舍不得给，写进提示词让它肉疼）
+ *   spares    —— 命中则 ×0.5（拿出去换正好），优先于 wantsUses
+ * 每个背包都**故意混着**这两类，别把人配成"什么都不在乎"。
+ */
 export const NPC_SEEDS: readonly NpcDef[] = [
   {
     id: 'su-wanzhao',
     name: '苏晚照',
     title: '药庐女医',
     generosity: 0.6,
+    wantsUses: ['疗伤', '补血', '调和'],
+    // 灵芝她留着没用 —— 正是「多余的」，拿出去换人情正好
+    spares: ['century-lingzhi'],
+    likes: ['能救人的药材', '肯为素不相识的人跑一趟'],
+    dislikes: ['拿人命讨价还价', '见伤不救还振振有词'],
     inventory: [
       { itemId: 'sanqi', count: 2 },
       { itemId: 'danggui', count: 1 },
-      { itemId: 'jinchuang-gao', count: 2 },
       { itemId: 'gancao', count: 3 },
-      { itemId: 'rations', count: 3 },
+      { itemId: 'jinchuang-gao', count: 2 },
+      { itemId: 'mugwort', count: 2 },
+      { itemId: 'huoxue-san', count: 1 },
       { itemId: 'century-lingzhi', count: 1 },
+      { itemId: 'rations', count: 3 },
     ],
   },
   {
@@ -45,13 +60,21 @@ export const NPC_SEEDS: readonly NpcDef[] = [
     name: '陆行舟',
     title: '走商',
     generosity: 0.75,
+    wantsUses: ['凭据', '信物', '器具'],
+    // 干粮清水他多得是，给出去不心疼
+    spares: ['rations', 'water'],
+    likes: ['爽快人', '懂行情的买家'],
+    dislikes: ['赊账不还', '拿假货糊弄他'],
     inventory: [
       { itemId: 'rations', count: 5 },
       { itemId: 'water', count: 4 },
-      { itemId: 'fire-starter', count: 2 },
       { itemId: 'gancao', count: 2 },
+      { itemId: 'fire-starter', count: 2 },
       { itemId: 'bamboo-whistle', count: 1 },
       { itemId: 'coldiron-needle', count: 2 },
+      { itemId: 'jade-beads', count: 1 },
+      { itemId: 'bamboo-tally', count: 2 },
+      { itemId: 'coin-string', count: 3 },
     ],
   },
   {
@@ -59,10 +82,68 @@ export const NPC_SEEDS: readonly NpcDef[] = [
     name: '阿癞',
     title: '落魄游侠',
     generosity: 0.2,
-    // 空背包：身无长物 → 发不出奖励 → 不该触发任务（§3.2）
+    wantsUses: ['吃食', '疗伤'],
+    spares: [],
+    likes: ['给他一口热乎的', '不提他的旧事'],
+    dislikes: ['施舍的语气', '拿他的落魄开玩笑'],
+    // 空背包：身无长物 → 发不出奖励 → 不该触发任务（§3.2）。
+    // 他是「背包枯竭就不触发任务」这道闸门的样板，故意留空、不给他配东西。
     inventory: [],
   },
 ];
+
+/* ----------------------- 主观估值（只进叙事与展示） ----------------------- */
+
+/** 命中「她在意的用途」时的倍数：舍不得给 */
+export const CHERISHED_MULTIPLIER = 3;
+/** 命中「她多余的」时的倍数：拿出去换正好 */
+export const SPARE_MULTIPLIER = 0.5;
+
+export type NpcItemBias = 'cherished' | 'spare' | 'neutral';
+
+/**
+ * 这位 NPC 怎么看这件道具：
+ *   spares 命中 → 'spare'（**优先**，用来覆盖用途推不出来的特例）
+ *   wantsUses 与道具的 uses 相交 → 'cherished'
+ *   其余 → 'neutral'
+ *
+ * ⚠️ 主观估值**只准进提示词与展示**：任何裁决都不得据它驳回提案
+ * （用户拍板：只做叙事引导）。
+ */
+export function itemBiasFor(npc: NpcState, itemId: string): NpcItemBias {
+  if (npc.spares.includes(itemId)) return 'spare';
+  const item = getItem(itemId);
+  if (!item) return 'neutral';
+  return item.uses.some((use) => npc.wantsUses.includes(use)) ? 'cherished' : 'neutral';
+}
+
+/** 主观估值 = 参考价值 × 主观倍数（四舍五入） */
+export function subjectiveValueOf(npc: NpcState, itemId: string): number {
+  const base = getItem(itemId)?.value ?? 0;
+  const bias = itemBiasFor(npc, itemId);
+  if (bias === 'cherished') return Math.round(base * CHERISHED_MULTIPLIER);
+  if (bias === 'spare') return Math.round(base * SPARE_MULTIPLIER);
+  return base;
+}
+
+function biasItems(npc: NpcState, bias: NpcItemBias): ItemDef[] {
+  const out: ItemDef[] = [];
+  for (const stack of listAvailable(npc.inventory)) {
+    const item = getItem(stack.itemId);
+    if (item && itemBiasFor(npc, stack.itemId) === bias) out.push(item);
+  }
+  return out.sort((a, b) => b.value - a.value);
+}
+
+/** 背包里让她「舍不得给」的东西（按参考价值降序） */
+export function cherishedItems(npc: NpcState): ItemDef[] {
+  return biasItems(npc, 'cherished');
+}
+
+/** 背包里她觉得「多余」的东西 */
+export function spareItems(npc: NpcState): ItemDef[] {
+  return biasItems(npc, 'spare');
+}
 
 /** 玩家开局背包（寻药这类任务需要玩家先有可交之物） */
 export const DEFAULT_PLAYER_INVENTORY: readonly ItemStack[] = [
@@ -89,6 +170,10 @@ export function createWorld(options: CreateWorldOptions = {}): World {
       name: seed.name,
       title: seed.title,
       generosity: seed.generosity,
+      wantsUses: [...seed.wantsUses],
+      spares: [...seed.spares],
+      likes: [...seed.likes],
+      dislikes: [...seed.dislikes],
       inventory: createInventory(seed.id, [...seed.inventory]),
     };
   }
@@ -97,6 +182,8 @@ export function createWorld(options: CreateWorldOptions = {}): World {
     name: options.playerName ?? '行客',
     inventory: createInventory(DEFAULT_PLAYER_ID, [...(options.playerInventory ?? DEFAULT_PLAYER_INVENTORY)]),
     affinity: {},
+    stagePeak: {},
+    impressionGainAt: {},
     abilities: [],
     knowledge: [],
     talks: {},
@@ -164,7 +251,22 @@ export interface NpcSnapshot {
   name: string;
   title: string;
   generosity: number;
-  available: Array<{ itemId: string; name: string; tier: string; count: number; unitValue: number }>;
+  /** 她在意的用途 / 她多余的（主观估值只进提示词与展示，不参与裁决） */
+  wantsUses: string[];
+  spares: string[];
+  likes: string[];
+  dislikes: string[];
+  available: Array<{
+    itemId: string;
+    name: string;
+    tier: string;
+    count: number;
+    unitValue: number;
+    /** 她怎么看这件东西 */
+    bias: NpcItemBias;
+    /** 她心里的估值（参考价值 × 主观倍数） */
+    subjectiveValue: number;
+  }>;
   held: Array<{ itemId: string; name: string; count: number; questId: string }>;
   openQuestId: string | null;
 }
@@ -178,12 +280,18 @@ export function inspectNpc(world: World, npcId: string): NpcSnapshot | null {
     name: npc.name,
     title: npc.title,
     generosity: npc.generosity,
+    wantsUses: [...npc.wantsUses],
+    spares: [...npc.spares],
+    likes: [...npc.likes],
+    dislikes: [...npc.dislikes],
     available: listAvailable(npc.inventory).map((stack) => ({
       itemId: stack.itemId,
       name: getItem(stack.itemId)?.name ?? stack.itemId,
       tier: getItem(stack.itemId)?.tier ?? 'common',
       count: stack.count,
       unitValue: getItem(stack.itemId)?.value ?? 0,
+      bias: itemBiasFor(npc, stack.itemId),
+      subjectiveValue: subjectiveValueOf(npc, stack.itemId),
     })),
     held: listHolds(npc.inventory).map((hold) => ({
       itemId: hold.itemId,
@@ -234,7 +342,7 @@ export function nextId(draft: World, kind: keyof World['seq']): string {
 /** 只在草案世界上调用：追加事件流水 */
 export function draftPushEvent(
   draft: World,
-  input: { type: QuestEventType; questId: string; npcId: string; detail: string; at: number },
+  input: { type: QuestEventType; questId: string | null; npcId: string; detail: string; at: number },
 ): QuestEvent {
   const event: QuestEvent = {
     id: nextId(draft, 'event'),

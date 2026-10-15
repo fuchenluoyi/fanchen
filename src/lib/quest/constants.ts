@@ -2,7 +2,28 @@
  * 领域常量：珍贵等级、奖励档位、能力白名单、拒绝文案、门控开关。
  * 纯数据，无副作用。
  */
-import type { AbilityId, ItemTier, OfferLevel, QuestErrorCode } from './types.ts';
+import type { AbilityId, ImpressionKind, ItemTier, OfferLevel, QuestErrorCode } from './types.ts';
+
+/* ------------------------------ 道具用途 ------------------------------ */
+
+/**
+ * 用途词表（比 tags 细一档）：NPC 的 `wantsUses` 与道具的 `uses` 都只能从这里取，
+ * `auditItemTable()` 会拦住词表外的写法。
+ */
+export const ITEM_USES: readonly string[] = [
+  '疗伤',
+  '补血',
+  '调和',
+  '滋补',
+  '提神',
+  '吃食',
+  '器具',
+  '凭据',
+  '兵器',
+  '材料',
+  '信物',
+  '传信',
+];
 
 /* ------------------------------ 珍贵等级 ------------------------------ */
 
@@ -46,14 +67,10 @@ export const OFFER_LEVEL_LABEL: Record<OfferLevel, string> = {
   3: '重谢',
 };
 
-/** 道具奖励的价值上限：模型只能在档位里让步，不能自己加档（§3.3） */
-export const OFFER_LEVEL_VALUE_CAP: Record<OfferLevel, number> = {
-  1: 20,
-  2: 80,
-  3: 300,
-};
-
-/** 好感度奖励的单次上限：比道具更保守，因为好感度发放后难以回收 */
+/**
+ * 好感度奖励的单次上限：比道具更保守，因为好感度发放后难以回收。
+ * **只有没有守恒的东西才设数值上限** —— 道具奖励有背包守恒，所以不再设价值上限。
+ */
 export const OFFER_LEVEL_AFFINITY_CAP: Record<OfferLevel, number> = {
   1: 3,
   2: 6,
@@ -86,6 +103,29 @@ export const ABILITY_LABEL: Record<AbilityId, string> = {
 /** 能力解锁属于最高价值的奖励，只允许出现在「大事」上（§3.2） */
 export const ABILITY_REQUIRES_TIER = 3;
 
+/* ------------------------------ 印象与好感度 ------------------------------ */
+
+export const IMPRESSION_KINDS: readonly ImpressionKind[] = ['pleased', 'neutral', 'offended'];
+
+/** 印象计分：说到心坎里 +2 / 不咸不淡 0 / 冒犯 -1（温和） */
+export const IMPRESSION_DELTA: Record<ImpressionKind, number> = {
+  pleased: 2,
+  neutral: 0,
+  offended: -1,
+};
+
+/**
+ * 印象冷却（按对话轮数）：同一 NPC 每 2 轮最多因印象涨一次 ——
+ * 防「同一套恭维反复刷」。offended **不受冷却限制**：说错话立刻有代价。
+ */
+export const IMPRESSION_COOLDOWN_ROUNDS = 2;
+
+export const IMPRESSION_LABEL: Record<ImpressionKind, string> = {
+  pleased: '说到心坎里',
+  neutral: '不咸不淡',
+  offended: '冒犯了',
+};
+
 /* ------------------------------ 门控开关 ------------------------------ */
 
 /** 同一 NPC 一次性只出现一个任务，完成才触发下一个（§3.2 串行任务链） */
@@ -103,7 +143,6 @@ export const ERROR_MESSAGE: Record<QuestErrorCode, string> = {
   unknown_item: '这件道具不在道具白名单里',
   unknown_ability: '这个能力不在能力白名单里',
   invalid_tier: '任务重要性只能是 1（小事）/ 2（正事）/ 3（大事）',
-  invalid_offer_level: '奖励档位只能是 1 / 2 / 3',
   idempotency_key_reused: '同一个 requestId 被换了参数重复使用',
   invalid_objective: '目标不符合原语规范',
   unsupported_objective: '这个目标原语依赖尚不存在的系统，暂时无法裁决',
@@ -124,4 +163,6 @@ export const ERROR_MESSAGE: Record<QuestErrorCode, string> = {
   player_item_insufficient: '玩家背包里的这件道具不够',
   objective_not_met: '任务目标尚未达成',
   insufficient_items: '库存不足',
+  invalid_impression: '印象只能记成 pleased / neutral / offended 三种之一',
+  impression_cooldown: '同一套恭维短期内重复太多次，这次不再加分',
 };

@@ -25,11 +25,18 @@ import type {
   TaskStatus,
 } from '../types.ts';
 import type { QuestChannelEvent, QuestRuling } from '../lib/quest/bridge.ts';
-import { applyPlayerAccept, applyPlayerDecline, applyQuestEvent } from '../lib/quest/bridge.ts';
+import {
+  applyPlayerAccept,
+  applyPlayerDecline,
+  applyPlayerSubmit,
+  applyQuestEvent,
+  applyQuestImpression,
+} from '../lib/quest/bridge.ts';
 import { normalizeStoredWorld } from '../lib/quest/persist.ts';
 import { buildNpcSystemPrompt } from '../lib/quest/prompt.ts';
-import type { World } from '../lib/quest/types.ts';
-import { QUEST_ACTION_LABEL } from '../lib/labels.ts';
+import type { ItemStack, World } from '../lib/quest/types.ts';
+import { QUEST_ACTION_LABEL, playerQuestRejectionText } from '../lib/labels.ts';
+import { messagesOfThread, normalizeThreadId, threadIdFor } from '../lib/threads.ts';
 import { buildRequestMessages, hasCredentials, loadSettings, normalizeSettings, saveSettings } from '../lib/settings.ts';
 import { STORAGE_KEYS, isArrayOfObjects, loadJson, removeKeys, saveJson } from '../lib/storage.ts';
 import { createId } from '../lib/id.ts';
@@ -65,7 +72,7 @@ type Action =
   | { type: 'message/add'; payload: ChatMessage }
   | { type: 'message/append'; payload: { id: string; kind: 'content' | 'reasoning'; text: string } }
   | { type: 'message/finish'; payload: { id: string; status: ChatMessage['status']; errorText?: string } }
-  | { type: 'message/clear' }
+  | { type: 'message/clearThread'; payload: string }
   | { type: 'message/highlight'; payload: string | null }
   | { type: 'tasks/addMany'; payload: Task[] }
   | { type: 'tasks/status'; payload: { id: string; status: TaskStatus } }
@@ -142,6 +149,8 @@ function createInitialState(): State {
     .filter((m) => m && typeof m.content === 'string' && (m.role === 'user' || m.role === 'assistant'))
     .map<ChatMessage>((m) => ({
       ...m,
+      // 旧存档没有线索字段 → 一律归需求台（老原型就是需求台）
+      npcId: normalizeThreadId(m.npcId),
       // 上次没写完就关页面的消息，标记为已中断
       status: m.status === 'streaming' ? 'aborted' : m.status,
     }));
@@ -200,8 +209,13 @@ function reducer(state: State, action: Action): State {
             : message,
         ),
       };
-    case 'message/clear':
-      return { ...state, messages: [], highlightMessageId: null };
+    case 'message/clearThread':
+      // 只清当前线索：别的 NPC（或需求台）的对话还在
+      return {
+        ...state,
+        messages: state.messages.filter((message) => normalizeThreadId(message.npcId) !== action.payload),
+        highlightMessageId: null,
+      };
     case 'message/highlight':
       return { ...state, highlightMessageId: action.payload };
     case 'tasks/addMany':
@@ -258,6 +272,8 @@ export interface StoreValue {
   acceptQuest: (questId: string) => void;
   /** 玩家点【婉拒】：释放该委托预留的谢礼 */
   declineQuest: (questId: string, reason?: string) => void;
+  /** 玩家点【交付 / 请对方验看】：走裁决层提交（交付型带 deliver，非交付型不带） */
+  deliverQuest: (questId: string, deliver?: ItemStack) => void;
   setTaskStatus: (id: string, status: TaskStatus) => void;
   removeTask: (id: string) => void;
   clearMessages: () => void;
@@ -331,10 +347,13 @@ export function StoreProvider({ children }: { children: ReactNode }) {
     if (!text || current.busy) return;
 
     const settings = current.settings;
+    // 这一轮属于哪条线索：'desk' 或当前 NPC 的 id
+    const threadId = threadIdFor(settings);
     const userMessage: ChatMessage = {
       id: createId('msg'),
       role: 'user',
       content: text,
+      npcId: threadId,
       createdAt: Date.now(),
       status: 'done',
     };
@@ -342,12 +361,15 @@ export function StoreProvider({ children }: { children: ReactNode }) {
       id: createId('msg'),
       role: 'assistant',
       content: '',
+      npcId: threadId,
       createdAt: Date.now(),
       status: 'streaming',
     };
 
-    const history = [...current.messages, userMessage]
-      .filter((m) => m.role === 'user' || m.role === 'assistant')
+    // 只把**当前线索**的历史发给模型：否则切到陆行舟后还会收到苏晚照的旧话，
+    // 两个人格就糊在一起了
+    const history = [...messagesOfThread(current.messages, threadId), userMessage]
+      .filter((m) => (m.role === 'user' || m.role === 'assistant') && m.content.trim())
       .map((m) => ({ role: m.role as 'user' | 'assistant', content: m.content }));
 
     dispatch({ type: 'message/add', payload: userMessage });
@@ -369,6 +391,10 @@ export function StoreProvider({ children }: { children: ReactNode }) {
     let worldDraft = current.world;
     /** 本轮发生的裁决，按时间顺序 */
     const rulings: QuestRuling[] = [];
+    /** 印象每轮只认第一条：模型一口气记好几次，多半是在刷好感度 */
+    let impressionHandled = false;
+    /** 被忽略的重复印象调用，收尾时记进审计（拒绝/忽略都不静默） */
+    const extraImpressions: string[] = [];
     // 只读真相随之进 prompt：只有 NPC 自己的视角（ADR-013）
     const systemContent = npcMode
       ? buildNpcSystemPrompt(worldDraft, settings.questNpcId, current.lastRuling, settings.systemPrompt)
@@ -416,6 +442,25 @@ export function StoreProvider({ children }: { children: ReactNode }) {
                 npcId: settings.questNpcId,
                 requestId: createId('req'),
                 dialogueId: assistantMessage.id,
+                now: Date.now(),
+              });
+              worldDraft = outcome.world;
+              rulings.push(outcome.ruling);
+              break;
+            }
+            case 'quest_impression': {
+              if (!npcMode) break;
+              // 每轮只认第一条：多调无效，但要留痕
+              if (impressionHandled) {
+                extraImpressions.push('本轮重复调用 note_impression，已忽略（每轮只认第一条）');
+                break;
+              }
+              impressionHandled = true;
+              const outcome = applyQuestImpression(worldDraft, {
+                npcId: settings.questNpcId,
+                impression: event.impression.kind,
+                ...(event.impression.reason ? { reason: event.impression.reason } : {}),
+                requestId: createId('req'),
                 now: Date.now(),
               });
               worldDraft = outcome.world;
@@ -473,6 +518,24 @@ export function StoreProvider({ children }: { children: ReactNode }) {
       // 每一笔裁决都留痕；拒绝绝不静默
       for (const ruling of rulings) {
         dispatch({ type: 'audit/push', payload: buildQuestAudit(ruling, assistantMessage.id, durationMs) });
+      }
+      // 被忽略的重复印象调用也留痕（多调无效，但不能静默）
+      for (const note of extraImpressions) {
+        dispatch({
+          type: 'audit/push',
+          payload: {
+            id: createId('audit'),
+            at: Date.now(),
+            messageId: assistantMessage.id,
+            triggered: false,
+            reasons: ['note_impression'],
+            channel: 'tool',
+            produced: 0,
+            dropped: 1,
+            durationMs,
+            note,
+          },
+        });
       }
       const rejected = rulings.find((ruling) => !ruling.ok);
       if (rejected) {
@@ -640,6 +703,26 @@ export function StoreProvider({ children }: { children: ReactNode }) {
     });
   }, []);
 
+  /** 玩家点【交付 / 请对方验看】：走裁决层提交（界面不替裁决层判断够不够） */
+  const deliverQuest = useCallback((questId: string, deliver?: ItemStack) => {
+    const current = stateRef.current;
+    const outcome = applyPlayerSubmit(current.world, {
+      questId,
+      requestId: createId('req'),
+      now: Date.now(),
+      ...(deliver ? { deliver } : {}),
+    });
+    dispatch({ type: 'world/set', payload: outcome.world });
+    dispatch({ type: 'ruling/set', payload: outcome.ruling });
+    dispatch({ type: 'audit/push', payload: buildQuestAudit(outcome.ruling, null, 0) });
+    dispatch({
+      type: 'toast/set',
+      payload: outcome.ruling.ok
+        ? outcome.ruling.message
+        : playerQuestRejectionText(outcome.ruling.code, outcome.ruling.message),
+    });
+  }, []);
+
   const setTaskStatus = useCallback((id: string, status: TaskStatus) => {
     dispatch({ type: 'tasks/status', payload: { id, status } });
   }, []);
@@ -649,7 +732,8 @@ export function StoreProvider({ children }: { children: ReactNode }) {
   }, []);
 
   const clearMessages = useCallback(() => {
-    dispatch({ type: 'message/clear' });
+    // 只清当前线索：切回别的 NPC 时，你们之前的对话还在
+    dispatch({ type: 'message/clearThread', payload: threadIdFor(stateRef.current.settings) });
     dispatch({ type: 'candidates/clear' });
   }, []);
 
@@ -714,6 +798,7 @@ export function StoreProvider({ children }: { children: ReactNode }) {
       acceptAllCandidates,
       acceptQuest,
       declineQuest,
+      deliverQuest,
       setTaskStatus,
       removeTask,
       clearMessages,
@@ -736,6 +821,7 @@ export function StoreProvider({ children }: { children: ReactNode }) {
       acceptAllCandidates,
       acceptQuest,
       declineQuest,
+      deliverQuest,
       setTaskStatus,
       removeTask,
       clearMessages,

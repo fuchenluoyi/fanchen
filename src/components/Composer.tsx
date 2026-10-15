@@ -1,11 +1,19 @@
 import { useState, type KeyboardEvent } from 'react';
 import { useStore } from '../state/store.tsx';
+import { getNpc } from '../lib/quest/index.ts';
+import { messagesOfThread, threadIdFor } from '../lib/threads.ts';
 
 /** 输入区（FR-001 / FR-013）。 */
 export function Composer() {
   const { state, send, stop, configured } = useStore();
   const [text, setText] = useState('');
   const busy = state.busy;
+  // 计数与措辞都跟着**当前线索**走（每个 NPC 一条独立会话）
+  const threadCount = messagesOfThread(state.messages, threadIdFor(state.settings)).length;
+  const partner =
+    state.settings.chatMode === 'npc'
+      ? getNpc(state.world, state.settings.questNpcId)?.name ?? '对方'
+      : '凡尘';
 
   const submit = () => {
     const value = text.trim();
@@ -35,7 +43,7 @@ export function Composer() {
       />
       <div className="composer__actions">
         <span className="composer__hint">
-          {busy ? '凡尘正在落笔…' : `共 ${state.messages.length} 条消息`}
+          {busy ? `${partner}正在斟酌…` : `本会话共 ${threadCount} 条消息`}
         </span>
         {busy ? (
           <button type="button" className="btn btn--danger" onClick={stop}>

@@ -12,14 +12,25 @@
  * 拒绝一律返回 { ok: false, code, message }，code 见 constants.ERROR_MESSAGE ——
  * 那张表就是给模型和界面看的「校验规则表」。
  */
-import { ABILITY_LABEL, ERROR_MESSAGE, FORGO_AFFINITY_BONUS, ONE_OPEN_QUEST_PER_NPC } from './constants.ts';
+import {
+  ABILITY_LABEL,
+  ERROR_MESSAGE,
+  FORGO_AFFINITY_BONUS,
+  IMPRESSION_COOLDOWN_ROUNDS,
+  IMPRESSION_DELTA,
+  IMPRESSION_KINDS,
+  IMPRESSION_LABEL,
+  ONE_OPEN_QUEST_PER_NPC,
+} from './constants.ts';
 import { QuestError } from './types.ts';
 import type {
   Adjudication,
   Applied,
   Hold,
+  ImpressionKind,
   ItemStack,
   OfferLevel,
+  PlayerState,
   Quest,
   QuestTier,
   RewardDef,
@@ -35,6 +46,7 @@ import {
   objectiveSatisfied,
   validateObjective,
 } from './objectives.ts';
+import { nextStagePeak } from './relationship.ts';
 import { describeReward, maxOfferLevel, rewardItemRef, validateReward } from './rewards.ts';
 import { cloneWorld, draftPushEvent, getNpc, getQuest, nextId, openQuestOfNpc } from './world.ts';
 
@@ -50,8 +62,11 @@ export interface ProposeQuestInput {
   tier: QuestTier;
   objective: ObjectivePrimitive;
   reward: RewardDef;
-  /** 自报档位；超过代码算出的上限会被拒（模型只能在档位内让步，不能加档） */
-  offerLevel?: OfferLevel;
+  /**
+   * 档位**由代码算**：`maxOfferLevel({ questTier, generosity })`。
+   * 模型不再自报档位（自报那次正是翻车的源头），所以这里没有 offer_level 入参。
+   * 算出来的档位只用于两件事：好感度奖励的上限、能力奖励是否允许出现在这一档。
+   */
   sourceDialogueId?: string | null;
   draftedBy?: 'dialogue' | 'cli' | 'authored';
   now?: number;
@@ -78,6 +93,14 @@ function requireRequestId(requestId: string): void {
   if (typeof requestId !== 'string' || !requestId.trim()) {
     throw new QuestError('invalid_field', 'requestId 不能为空：幂等键是裁决层的硬要求');
   }
+}
+
+/**
+ * 只在草案世界上调用：把「历史最高关系阶段」抬到当前好感度对应的位置。
+ * **单向不回落** —— 好感度掉下去也不降阶（玩家会记得"我们曾经是知己"）。
+ */
+function bumpStagePeak(player: PlayerState, npcId: string): void {
+  player.stagePeak[npcId] = nextStagePeak(player.affinity[npcId] ?? 0, player.stagePeak[npcId]);
 }
 
 /**
@@ -181,7 +204,6 @@ export function proposeQuest(world: World, input: ProposeQuestInput): Adjudicati
       tier: input.tier,
       objective: input.objective,
       reward: input.reward,
-      offerLevel: input.offerLevel ?? null,
       sourceDialogueId: input.sourceDialogueId ?? null,
       draftedBy,
     };
@@ -204,17 +226,8 @@ export function proposeQuest(world: World, input: ProposeQuestInput): Adjudicati
     validateObjective(input.objective);
     assertObjectiveSupported(input.objective);
 
-    const cap = maxOfferLevel({ questTier: input.tier, generosity: npc.generosity });
-    const offerLevel: OfferLevel = input.offerLevel ?? cap;
-    if (offerLevel !== 1 && offerLevel !== 2 && offerLevel !== 3) {
-      throw new QuestError('invalid_offer_level', ERROR_MESSAGE.invalid_offer_level);
-    }
-    if (offerLevel > cap) {
-      throw new QuestError(
-        'reward_over_cap',
-        `自报档位 ${offerLevel} 超过「${npc.name}」在这个重要性上的上限 ${cap}`,
-      );
-    }
+    // 档位由代码算，模型自报无效（自报档位正是上次翻车的源头）
+    const offerLevel: OfferLevel = maxOfferLevel({ questTier: input.tier, generosity: npc.generosity });
 
     validateReward(npc, input.reward, offerLevel, input.tier);
 
@@ -539,6 +552,7 @@ export function submitQuest(world: World, input: SubmitQuestInput): Adjudication
       case 'affinity': {
         const next = (draft.player.affinity[npc.id] ?? 0) + quest.reward.amount;
         draft.player.affinity[npc.id] = next;
+        bumpStagePeak(draft.player, npc.id);
         applied.push(`发放奖励：好感度 +${quest.reward.amount}（${npc.name} 处累计 ${next}）`);
         break;
       }
@@ -557,6 +571,7 @@ export function submitQuest(world: World, input: SubmitQuestInput): Adjudication
       case 'none': {
         const next = (draft.player.affinity[npc.id] ?? 0) + FORGO_AFFINITY_BONUS;
         draft.player.affinity[npc.id] = next;
+        bumpStagePeak(draft.player, npc.id);
         applied.push(`玩家不要奖励，好感度 +${FORGO_AFFINITY_BONUS}（累计 ${next}）`);
         break;
       }
@@ -589,5 +604,82 @@ export function submitQuest(world: World, input: SubmitQuestInput): Adjudication
     return { ok: true, world: draft, quest, replay: false, applied };
   } catch (err) {
     return toRejection(world, err, getQuest(world, input.questId));
+  }
+}
+
+/* ============================ 印象（好感度的涨法） ============================ */
+
+export interface NoteImpressionInput {
+  requestId: string;
+  npcId: string;
+  impression: ImpressionKind;
+  reason?: string;
+  now?: number;
+}
+
+/**
+ * 记一次印象：模型判断「这一轮说到心坎里 / 冒犯了她」。
+ *
+ * 计分：pleased +2 / neutral 0 / offended -1（温和，见 IMPRESSION_DELTA）。
+ * 冷却：同一 NPC 每 {@link IMPRESSION_COOLDOWN_ROUNDS} 轮最多因印象**涨**一次
+ *       （用 `player.talks` 的轮数计数）；**offended 不受冷却限制** —— 说错话立刻有代价。
+ * 下限：好感度 clamp 到 >= 0，不允许为负。
+ *
+ * 这是**新增**的操作，不改变已有五个操作的语义。
+ */
+export function noteImpression(world: World, input: NoteImpressionInput): Adjudication {
+  try {
+    requireRequestId(input.requestId);
+    const fingerprint = {
+      npcId: input.npcId,
+      impression: input.impression,
+      reason: input.reason ?? null,
+    };
+    const { replay, draft } = begin(world, input.requestId, 'note_impression', fingerprint);
+    if (replay) return replay;
+    const now = input.now ?? Date.now();
+
+    const npc = getNpc(draft, input.npcId);
+    if (!npc) throw new QuestError('unknown_npc', `没有这个 NPC：${input.npcId}`);
+    if (!IMPRESSION_KINDS.includes(input.impression)) {
+      throw new QuestError('invalid_impression', ERROR_MESSAGE.invalid_impression);
+    }
+
+    const delta = IMPRESSION_DELTA[input.impression];
+    const rounds = draft.player.talks[npc.id] ?? 0;
+    const lastGainAt = draft.player.impressionGainAt[npc.id];
+
+    // 只有"涨"才受冷却约束；冒犯随时生效
+    if (delta > 0) {
+      if (typeof lastGainAt === 'number' && rounds - lastGainAt < IMPRESSION_COOLDOWN_ROUNDS) {
+        throw new QuestError(
+          'impression_cooldown',
+          `同一套恭维说太密了（上次第 ${lastGainAt} 轮、现在第 ${rounds} 轮），这次不再加分`,
+        );
+      }
+      draft.player.impressionGainAt[npc.id] = rounds;
+    }
+
+    const before = draft.player.affinity[npc.id] ?? 0;
+    const after = Math.max(0, before + delta);
+    draft.player.affinity[npc.id] = after;
+    bumpStagePeak(draft.player, npc.id);
+
+    const reasonText = input.reason?.trim();
+    const applied = [
+      `${npc.name} 的印象：${IMPRESSION_LABEL[input.impression]}（好感度 ${before} → ${after}）`,
+      ...(reasonText ? [`缘由：${reasonText}`] : []),
+    ];
+    draftPushEvent(draft, {
+      type: 'impression_noted',
+      questId: null, // 印象不属于任何委托
+      npcId: npc.id,
+      detail: `${IMPRESSION_LABEL[input.impression]}${reasonText ? `：${reasonText}` : ''}（好感度 ${before} → ${after}）`,
+      at: now,
+    });
+    commit(draft, input.requestId, 'note_impression', fingerprint, null);
+    return { ok: true, world: draft, quest: null, replay: false, applied };
+  } catch (err) {
+    return toRejection(world, err, null);
   }
 }

@@ -5,14 +5,17 @@ import {
   OFFER_LEVEL_LABEL,
   QUEST_TIER_LABEL,
   TIER_LABEL,
+  availableOf,
   describeObjective,
   describeReward,
   getItem,
   getNpc,
   inspectNpc,
+  itemName,
+  objectiveItemRef,
   questsOfNpc,
 } from '../lib/quest/index.ts';
-import type { NpcSnapshot, Quest } from '../lib/quest/index.ts';
+import type { Inventory, ItemStack, NpcSnapshot, Quest } from '../lib/quest/index.ts';
 
 /** 一次最多列几条委托（更早的还在世界里，只是不占版面） */
 const MAX_VISIBLE_QUESTS = 6;
@@ -29,7 +32,7 @@ function tierOf(itemId: string): string {
  * 哪件谢礼已经被哪条委托锁住（预留锁）。
  */
 export function QuestPanel() {
-  const { state, acceptQuest, declineQuest } = useStore();
+  const { state, acceptQuest, declineQuest, deliverQuest } = useStore();
   const [showBag, setShowBag] = useState(false);
 
   const npcId = state.settings.questNpcId;
@@ -80,8 +83,10 @@ export function QuestPanel() {
             key={quest.id}
             quest={quest}
             npcName={npc.name}
+            playerInventory={state.world.player.inventory}
             onAccept={() => acceptQuest(quest.id)}
             onDecline={() => declineQuest(quest.id, '玩家在委托面板上婉拒')}
+            onDeliver={(deliver) => deliverQuest(quest.id, deliver)}
           />
         ))
       )}
@@ -98,14 +103,27 @@ export function QuestPanel() {
 function QuestCard({
   quest,
   npcName,
+  playerInventory,
   onAccept,
   onDecline,
+  onDeliver,
 }: {
   quest: Quest;
   npcName: string;
+  playerInventory: Inventory;
   onAccept: () => void;
   onDecline: () => void;
+  onDeliver: (deliver?: ItemStack) => void;
 }) {
+  // 交付型：按钮直接带上目标道具与数量；非交付型：只是请对方验看。
+  // 玩家持有量是**玩家自己**的视角，读它不违反 ADR-013（不注入给模型）。
+  const itemRef = objectiveItemRef(quest.objective);
+  const needsDelivery = quest.objective.kind === 'deliver_item';
+  const have = itemRef ? availableOf(playerInventory, itemRef.itemId) : 0;
+  const short = itemRef ? have < itemRef.count : false;
+  const deliverLabel =
+    needsDelivery && itemRef ? `交付 ${itemName(itemRef.itemId)}×${itemRef.count}` : '请对方验看';
+
   return (
     <article className="candidate">
       <div className="candidate__head">
@@ -136,9 +154,30 @@ function QuestCard({
       ) : null}
 
       {quest.status === 'accepted' ? (
+        <div className="candidate__actions">
+          {/* 显式完成入口：走裁决层；持有不足也能点，界面不替裁决层做判断 */}
+          <button
+            type="button"
+            className={`btn btn--sm ${short ? 'btn--ghost btn--danger-text' : 'btn--primary'}`}
+            title={short ? '你身上还不够；点了也会由系统驳回并说明原因' : undefined}
+            onClick={() =>
+              onDeliver(needsDelivery && itemRef ? { itemId: itemRef.itemId, count: itemRef.count } : undefined)
+            }
+          >
+            {deliverLabel}
+          </button>
+          {itemRef ? (
+            <span className={`badge ${short ? 'badge--muted' : 'badge--ok'}`}>
+              你持有 {itemName(itemRef.itemId)}×{have}（需 {itemRef.count}）
+            </span>
+          ) : null}
+        </div>
+      ) : null}
+
+      {quest.status === 'accepted' ? (
         <p className="candidate__evidence">
-          已接取 —— 在对话里把东西交给 {npcName} 即可（{describeObjective(quest.objective)}
-          ）。交付由系统核对，{npcName} 说了不算。
+          也可以在对话里把东西交给 {npcName}（{describeObjective(quest.objective)}
+          ）；无论走哪条路，交付都由系统核对，{npcName} 说了不算。
         </p>
       ) : null}
 
@@ -152,6 +191,9 @@ function QuestCard({
 function NpcBag({ snapshot }: { snapshot: NpcSnapshot }) {
   return (
     <div className="task__detail">
+      <div className="task__label">
+        她在意的：{snapshot.wantsUses.length > 0 ? snapshot.wantsUses.join('、') : '（没有特别的）'}
+      </div>
       <div className="task__label">可用道具</div>
       {snapshot.available.length === 0 ? (
         <p className="empty-hint empty-hint--small">背包空空 —— 拿不出谢礼，它也就不会发布委托。</p>
@@ -160,6 +202,17 @@ function NpcBag({ snapshot }: { snapshot: NpcSnapshot }) {
           {snapshot.available.map((entry) => (
             <li key={entry.itemId}>
               {entry.name}（{entry.itemId}）· {tierOf(entry.itemId)} · 值 {entry.unitValue} · ×{entry.count}
+              {/* 主观估值只用于展示与叙事，不参与裁决 */}
+              {entry.bias === 'cherished' ? (
+                <span className="badge badge--muted" title="她舍不得给，但系统不会因此驳回任何提案">
+                  舍不得给
+                </span>
+              ) : null}
+              {entry.bias === 'spare' ? (
+                <span className="badge badge--muted" title="她留着没用，拿出去换正好">
+                  多余
+                </span>
+              ) : null}
             </li>
           ))}
         </ul>

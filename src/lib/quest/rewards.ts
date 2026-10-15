@@ -18,7 +18,6 @@ import {
   FORGO_AFFINITY_BONUS,
   OFFER_LEVEL_AFFINITY_CAP,
   OFFER_LEVEL_LABEL,
-  OFFER_LEVEL_VALUE_CAP,
 } from './constants.ts';
 import { getItem, isKnownItem, itemName, itemValue } from './items.ts';
 import { listAvailable, totalOf } from './inventory.ts';
@@ -56,8 +55,15 @@ export function maxOfferLevel(input: { questTier: QuestTier; generosity: number 
 }
 
 /**
- * 校验一条奖励是否合法。形状、白名单、NPC 持有情况、档位上限全部在这里判。
+ * 校验一条奖励是否合法。形状、白名单、NPC 持有情况在这里判。
  * 通过则返回 reward 本身，失败抛 QuestError。
+ *
+ * 数值上限的原则：**有守恒的不设数值上限，没有守恒的才设**。
+ *   - 道具：奖励是从 NPC 背包里转移出去的，有守恒 —— 所以**不按价值驳回**，
+ *     背包里有没有（reward_not_owned）与是否已被预留就是它的上限；
+ *     她心不心疼是叙事问题（wantsUses / spares 只进提示词），不是裁决问题。
+ *   - 好感度：发出去就收不回来，没有守恒 —— 所以仍受档位上限约束。
+ *   - 能力：布尔锁，按「大事」门控，不受数值上限约束。
  */
 export function validateReward(
   npc: NpcState,
@@ -82,14 +88,7 @@ export function validateReward(
           `${npc.name} 背包里没有「${itemName(reward.itemId)}」，拿不出的东西不能当奖励`,
         );
       }
-      const cap = OFFER_LEVEL_VALUE_CAP[offerLevel];
-      const value = rewardItemValue(reward);
-      if (value > cap) {
-        throw new QuestError(
-          'reward_over_cap',
-          `奖励价值 ${value} 超过「${OFFER_LEVEL_LABEL[offerLevel]}」的上限 ${cap}`,
-        );
-      }
+      // 道具**不判价值上限**：背包即上限（见上面的原则说明）
       return reward;
     }
     case 'affinity': {
@@ -152,22 +151,21 @@ export function describeReward(reward: RewardDef): string {
 }
 
 /**
- * 该 NPC 在当前档位下**拿得出来**的奖励候选。
+ * 该 NPC **拿得出来**的奖励候选。
  * 这是给模型的「只读真相」：有了它，模型不必猜背包里有什么（§2.3）。
+ *
+ * 不再按档位价值过滤 —— 道具奖励没有数值上限（背包即上限），
+ * 这里如实列出背包里的东西，怎么挑是叙事的事。
  */
 export function rewardCandidates(
   npc: NpcState,
-  offerLevel: OfferLevel,
 ): Array<{ item: ItemDef; count: number; value: number }> {
-  const cap = OFFER_LEVEL_VALUE_CAP[offerLevel];
   const out: Array<{ item: ItemDef; count: number; value: number }> = [];
   for (const stack of listAvailable(npc.inventory)) {
     const def = getItem(stack.itemId);
     if (!def) continue;
     for (let count = 1; count <= stack.count; count += 1) {
-      const value = def.value * count;
-      if (value > cap) break;
-      out.push({ item: def, count, value });
+      out.push({ item: def, count, value: def.value * count });
     }
   }
   return out.sort((a, b) => b.value - a.value);

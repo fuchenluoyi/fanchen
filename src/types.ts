@@ -2,7 +2,7 @@
  * 全项目共享类型（ADR-005：状态层是唯一可变更数据的地方）。
  */
 import type { QuestProposalDraft } from './lib/quest/bridge.ts';
-import type { ItemStack } from './lib/quest/types.ts';
+import type { ImpressionKind, ItemStack } from './lib/quest/types.ts';
 
 /** 对话模式：npc = 扮演 NPC 发布委托；desk = 原有「玩家需求」需求台 */
 export type ChatMode = 'npc' | 'desk';
@@ -15,6 +15,12 @@ export interface ChatMessage {
   id: string;
   role: Role;
   content: string;
+  /**
+   * 这条消息属于哪条对话线索：'desk'（需求台）或某个 npcId。
+   * 每个 NPC 一条独立线索：切人会切到对应会话，互不污染；
+   * 旧存档里没有这个字段的消息一律归 'desk'，避免切换 NPC 后第一轮就串戏。
+   */
+  npcId: string;
   /** 思维链增量（部分模型返回 reasoning_content），折叠展示 */
   reasoning?: string;
   createdAt: number;
@@ -119,6 +125,7 @@ export type ServerEvent =
   | { type: 'quest_proposal'; index: number; proposal: QuestProposalDraft }
   | { type: 'quest_submit'; index: number; submission: QuestSubmissionPayload }
   | { type: 'quest_decline'; index: number; decline: QuestDeclinePayload }
+  | { type: 'quest_impression'; index: number; impression: QuestImpressionPayload }
   | { type: 'notice'; code: string; message: string }
   | { type: 'usage'; usage: Record<string, unknown> }
   | { type: 'done' }
@@ -133,5 +140,11 @@ export interface QuestSubmissionPayload {
 
 export interface QuestDeclinePayload {
   questId: string;
+  reason?: string;
+}
+
+/** 印象：模型对「这一轮说到心坎里 / 冒犯了她」的判断 */
+export interface QuestImpressionPayload {
+  kind: ImpressionKind;
   reason?: string;
 }

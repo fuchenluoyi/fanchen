@@ -13,17 +13,19 @@
 
 /* ============================== 常量 ============================== */
 
-export const QUEST_TOOL_NAMES = ['propose_quest', 'submit_quest', 'decline_quest'];
+export const QUEST_TOOL_NAMES = ['propose_quest', 'submit_quest', 'decline_quest', 'note_impression'];
 
 const OBJECTIVE_KINDS = ['deliver_item', 'has_item', 'talk_count', 'affinity_at_least'];
 const REWARD_KINDS = ['item', 'affinity', 'ability', 'info', 'none'];
 const ABILITY_IDS = ['jieyuan', 'qiecuo', 'michuan'];
+const IMPRESSION_KINDS = ['pleased', 'neutral', 'offended'];
 
 /* ============================== 工具定义 ============================== */
 
 /**
- * 三个工具全部是「提案」，没有一个是「执行」：
- * 模型说"我想给他这个"，至于背包里有没有、发不发得出去，由代码说了算（§2.3）。
+ * 四个工具全是「提案」，没有一个是「执行」：
+ * 模型说"我想给他这个""这话说到我心坎里了"，至于背包里有没有、发不发得出去、
+ * 好感度加不加得上，由代码说了算（§2.3）。
  */
 export const QUEST_TOOLS = [
   {
@@ -65,11 +67,6 @@ export const QUEST_TOOLS = [
           reward_affinity: { type: 'integer', description: 'reward_kind 为 affinity 时的好感度数值' },
           reward_ability: { type: 'string', enum: ABILITY_IDS, description: 'reward_kind 为 ability 时选一个' },
           reward_topic: { type: 'string', description: 'reward_kind 为 info 时的情报主题' },
-          offer_level: {
-            type: 'integer',
-            enum: [1, 2, 3],
-            description: '谢礼厚薄：1 薄礼 / 2 中酬 / 3 重谢。不得超过系统给你的上限，超了会被驳回',
-          },
         },
         required: ['title', 'want', 'tier', 'objective_kind', 'reward_kind'],
         additionalProperties: false,
@@ -108,6 +105,29 @@ export const QUEST_TOOLS = [
           reason: { type: 'string', description: '对方不接的缘由（可选）' },
         },
         required: ['quest_id'],
+        additionalProperties: false,
+      },
+    },
+  },
+  {
+    type: 'function',
+    function: {
+      name: 'note_impression',
+      description:
+        '记一笔你对对方的印象（这是好感度的涨法）。当这一轮对方说到你心坎里、或踩了你的忌讳时调用。' +
+        '同一套恭维第二次不再新鲜：系统会按冷却驳回（每 2 轮最多因印象涨一次），' +
+        '所以只在真的被触动或被冒犯时才用，别把恭维当口头禅。',
+      parameters: {
+        type: 'object',
+        properties: {
+          impression: {
+            type: 'string',
+            enum: IMPRESSION_KINDS,
+            description: 'pleased 说到心坎里（+2）/ neutral 不咸不淡（0）/ offended 冒犯了你（-1，马上生效）',
+          },
+          reason: { type: 'string', description: '缘由，一两句，算是你自己心里的记账' },
+        },
+        required: ['impression'],
         additionalProperties: false,
       },
     },
@@ -200,13 +220,9 @@ export function normalizeQuestProposal(raw) {
     return fail(`未知或缺失的 reward_kind：${rewardKind || '(空)'}，只能用 ${REWARD_KINDS.join(' / ')}`);
   }
 
-  /** @type {{ title: string; want: string; tier: number; objective: any; reward: any; offerLevel?: number }} */
+  /** @type {{ title: string; want: string; tier: number; objective: any; reward: any }} */
+  // 档位（offer_level）由前端按「事情轻重 + 为人」算，模型不再自报 —— 自报那次正是翻车的源头
   const proposal = { title: title.slice(0, 40), want: want.slice(0, 300), tier, objective, reward };
-  if (raw.offer_level !== undefined && raw.offer_level !== null && raw.offer_level !== '') {
-    const level = asInt(raw.offer_level, 0);
-    if (![1, 2, 3].includes(level)) return fail(`offer_level 必须是 1 / 2 / 3，收到 ${String(raw.offer_level)}`);
-    proposal.offerLevel = level;
-  }
   return { ok: true, proposal };
 }
 
@@ -249,6 +265,22 @@ export function normalizeQuestDecline(raw) {
   return { ok: true, decline: reason ? { questId, reason } : { questId } };
 }
 
+/* ---------------------------- note_impression ---------------------------- */
+
+/**
+ * @param {any} raw
+ * @returns {{ ok: true; impression: any } | { ok: false; reason: string }}
+ */
+export function normalizeQuestImpression(raw) {
+  if (!raw || typeof raw !== 'object' || Array.isArray(raw)) return fail('印象参数不是对象');
+  const kind = asText(raw.impression ?? raw.kind);
+  if (!IMPRESSION_KINDS.includes(kind)) {
+    return fail(`impression 只能是 ${IMPRESSION_KINDS.join(' / ')}，收到 ${kind || '(空)'}`);
+  }
+  const reason = asText(raw.reason).slice(0, 200);
+  return { ok: true, impression: reason ? { kind, reason } : { kind } };
+}
+
 /* ============================== 派发 ============================== */
 
 /**
@@ -274,6 +306,11 @@ export function mapQuestToolCall(name, rawArgs) {
       const result = normalizeQuestDecline(rawArgs);
       if (!result.ok) return { ok: false, name, reason: result.reason };
       return { ok: true, event: { type: 'quest_decline', decline: result.decline } };
+    }
+    case 'note_impression': {
+      const result = normalizeQuestImpression(rawArgs);
+      if (!result.ok) return { ok: false, name, reason: result.reason };
+      return { ok: true, event: { type: 'quest_impression', impression: result.impression } };
     }
     default:
       return { ok: false, name, reason: `不是委托类工具：${name}` };

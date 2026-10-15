@@ -13,6 +13,7 @@ import { createInventory, holdItem } from './inventory.ts';
 import { isAbilityId } from './rewards.ts';
 import { isKnownItem } from './items.ts';
 import { validateObjective } from './objectives.ts';
+import { STAGE_IDS } from './relationship.ts';
 import { DEFAULT_PLAYER_ID, NPC_SEEDS, createWorld } from './world.ts';
 import type {
   AbilityId,
@@ -55,6 +56,7 @@ const EVENT_TYPES = [
   'reward_granted',
   'reward_released',
   'quest_settled',
+  'impression_noted',
 ] as const;
 
 const MAX_EVENTS = 200;
@@ -280,14 +282,14 @@ function normalizeEvents(raw: unknown): QuestEvent[] {
     const type = entry.type;
     if (typeof type !== 'string' || !(EVENT_TYPES as readonly string[]).includes(type)) continue;
     const id = asText(entry.id);
-    const questId = asText(entry.questId);
     const npcId = asText(entry.npcId);
-    if (!id || !questId || !npcId) continue;
+    if (!id || !npcId) continue;
     out.push({
       id,
       at: asInt(entry.at, 0),
       type: type as QuestEvent['type'],
-      questId,
+      // 印象类事件不属于任何委托，questId 允许为 null
+      questId: asText(entry.questId),
       npcId,
       detail: typeof entry.detail === 'string' ? entry.detail.slice(0, 300) : '',
     });
@@ -344,6 +346,20 @@ export function normalizeStoredWorld(raw: unknown): World {
     for (const [npcId, value] of Object.entries(talksRaw)) {
       const rounds = asInt(value, 0);
       if (rounds > 0) fresh.player.talks[npcId] = rounds;
+    }
+    // 历史最高关系阶段（0..4，单向不回落）
+    const peakRaw = isRecord(playerRaw.stagePeak) ? playerRaw.stagePeak : {};
+    for (const [npcId, value] of Object.entries(peakRaw)) {
+      const peak = asInt(value, 0);
+      if (peak > 0) fresh.player.stagePeak[npcId] = Math.min(STAGE_IDS.length - 1, peak);
+    }
+    // 印象冷却用的轮数记录：只认真正的非负数字，
+    // 字符串脏值若退化成 0，会凭空让下一次印象白冷却 2 轮
+    const gainRaw = isRecord(playerRaw.impressionGainAt) ? playerRaw.impressionGainAt : {};
+    for (const [npcId, value] of Object.entries(gainRaw)) {
+      if (typeof value === 'number' && Number.isFinite(value) && value >= 0) {
+        fresh.player.impressionGainAt[npcId] = Math.trunc(value);
+      }
     }
   }
 

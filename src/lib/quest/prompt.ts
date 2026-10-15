@@ -2,8 +2,8 @@
  * NPC 模式的人格与只读真相（纯函数，可单测，不需要 DOM）。
  *
  * 遵守 ADR-013：注入给模型的真相**只有 NPC 自己的视角** ——
- *   自己的背包（可用 / 已预留 + 等级与价值）、自己的委托（含状态）、
- *   道具白名单（按珍贵等级分组）、玩家对自己的好感度。
+ *   自己的背包（可用 / 已预留 + 等级与价值 + 她怎么看这些东西）、自己的委托（含状态）、
+ *   道具白名单（按珍贵等级与用途分组）、玩家对自己的好感度与关系阶段。
  * **绝不注入玩家背包**：东西交没交到，由裁决层在 submitQuest 时核对；
  * NPC 对"交付已发生"的认知来自委托状态变化与下面的裁决事实。
  *
@@ -16,10 +16,10 @@ import type { QuestRuling } from './bridge.ts';
 import {
   ABILITY_LABEL,
   ABILITY_LIST,
+  IMPRESSION_COOLDOWN_ROUNDS,
   OFFER_LEVEL_AFFINITY_CAP,
   OFFER_LEVEL_LABEL,
   OFFER_LEVEL_LIST,
-  OFFER_LEVEL_VALUE_CAP,
   QUEST_TIER_LABEL,
   TIER_LABEL,
   TIER_LIST,
@@ -28,9 +28,10 @@ import {
 import { listAvailable, listHolds } from './inventory.ts';
 import { getItem, itemsByTier } from './items.ts';
 import { describeObjective } from './objectives.ts';
+import { STAGES, describeAttitude, peakStageOf, progressToNextStage } from './relationship.ts';
 import { describeReward } from './rewards.ts';
 import type { NpcState, Quest, World } from './types.ts';
-import { getNpc, questsOfNpc } from './world.ts';
+import { cherishedItems, getNpc, itemBiasFor, questsOfNpc, spareItems } from './world.ts';
 
 /** 一次最多复述多少条自己的委托（新到旧） */
 const MAX_QUEST_LINES = 6;
@@ -65,8 +66,10 @@ function renderOwnBag(npc: NpcState): string {
     for (const stack of available) {
       const def = getItem(stack.itemId);
       const tier = def ? TIER_LABEL[def.tier] : '未知';
+      const bias = itemBiasFor(npc, stack.itemId);
+      const mark = bias === 'cherished' ? ' · 我舍不得给' : bias === 'spare' ? ' · 我留着没用' : '';
       lines.push(
-        `- ${def?.name ?? stack.itemId}（id: ${stack.itemId}）· ${tier} · 单价 ${def?.value ?? 0} · ×${stack.count}`,
+        `- ${def?.name ?? stack.itemId}（id: ${stack.itemId}）· ${tier} · 单价 ${def?.value ?? 0} · ×${stack.count}${mark}`,
       );
     }
   }
@@ -77,6 +80,26 @@ function renderOwnBag(npc: NpcState): string {
       lines.push(`- ${def?.name ?? hold.itemId} ×${hold.count} ← 已许给委托 ${hold.questId}`);
     }
   }
+  return lines.join('\n');
+}
+
+/** 她的偏好：用途、舍不得给的、多余的、爱听与忌讳（**只影响说话与取舍，不是规则**） */
+function renderTastes(npc: NpcState): string {
+  const cherished = cherishedItems(npc);
+  const spares = spareItems(npc);
+  const lines = [
+    '【我的偏好】',
+    `我在意的用途：${npc.wantsUses.length > 0 ? npc.wantsUses.join('、') : '（没有特别的）'}`,
+    cherished.length > 0
+      ? `我舍不得给的：${cherished.map((item) => item.name).join('、')}（拿这些出去换，我会肉疼）`
+      : '我舍不得给的：（眼下没有）',
+    spares.length > 0
+      ? `我留着没用的：${spares.map((item) => item.name).join('、')}（拿这些去换正合适）`
+      : '我留着没用的：（眼下没有）',
+  ];
+  if (npc.likes.length > 0) lines.push(`我爱听的、在意的：${npc.likes.join('；')}`);
+  if (npc.dislikes.length > 0) lines.push(`我忌讳的：${npc.dislikes.join('；')}`);
+  lines.push('（这些只决定你怎么说话、愿意把什么拿出来换 —— 系统**不会**因为"我舍不得"就驳回你的提议。）');
   return lines.join('\n');
 }
 
@@ -108,7 +131,22 @@ function renderOwnQuests(world: World, npc: NpcState): string {
 function renderRelationship(world: World, npc: NpcState): string {
   const affinity = world.player.affinity[npc.id] ?? 0;
   const talks = world.player.talks[npc.id] ?? 0;
-  return ['【对方与我的关系】', `好感度：${affinity}`, `累计说过：${talks} 轮话`].join('\n');
+  const peak = world.player.stagePeak[npc.id];
+  const stage = peakStageOf(affinity, peak);
+  const progress = progressToNextStage(affinity, peak);
+  const index = STAGES.findIndex((entry) => entry.id === progress.stage);
+  const nextLabel = index >= 0 && index + 1 < STAGES.length ? STAGES[index + 1].label : null;
+
+  const lines = [
+    '【对方与我的关系】',
+    progress.nextThreshold === null || nextLabel === null
+      ? `你们的关系：${progress.label}（好感度 ${affinity}，已经是顶了）`
+      : `你们的关系：${progress.label}（好感度 ${affinity}，距「${nextLabel}」还差 ${progress.toNext}）`,
+    `累计说过：${talks} 轮话`,
+    describeAttitude(stage, npc),
+    '（关系只决定你说话的亲疏。事情能不能开口与阶段无关：低阶段也可以托付大事，只是别指望对方一口答应。）',
+  ];
+  return lines.join('\n');
 }
 
 function renderWhitelist(): string {
@@ -117,15 +155,16 @@ function renderWhitelist(): string {
     const items = itemsByTier(tier);
     if (items.length === 0) continue;
     const [min, max] = TIER_VALUE_RANGE[tier];
-    const list = items.map((item) => `${item.name}(${item.id}, 值${item.value})`).join('、');
+    const list = items
+      .map((item) => `${item.name}(${item.id}, 值${item.value}，用途${item.uses.join('/')})`)
+      .join('、');
     lines.push(`${TIER_LABEL[tier]}（值 ${min}-${max}）：${list}`);
   }
   lines.push('');
-  lines.push('谢礼档位上限（系统按事情轻重与你的为人算出，超了会被驳回）：');
+  lines.push('谢礼的规矩（档位由系统按事情轻重与你的为人算，**你不用自报档位**）：');
+  lines.push('- 道具：**没有价值上限**，只要是你背包里拿得出的、且没被别的委托预留就行（背包即上限）。');
   for (const level of OFFER_LEVEL_LIST) {
-    lines.push(
-      `- ${level} ${OFFER_LEVEL_LABEL[level]}：道具价值 ≤ ${OFFER_LEVEL_VALUE_CAP[level]}，好感度 ≤ +${OFFER_LEVEL_AFFINITY_CAP[level]}`,
-    );
+    lines.push(`- 好感度：${level} ${OFFER_LEVEL_LABEL[level]} 档最多 +${OFFER_LEVEL_AFFINITY_CAP[level]}（好感度没有守恒，所以要设上限）`);
   }
   lines.push(`- 功能解锁（只允许出现在「大事」上）：${ABILITY_LIST.map((id) => `${ABILITY_LABEL[id]}(${id})`).join('、')}`);
   lines.push('- 也可以不收谢礼：reward_kind 用 none，对方会额外得到一点好感度。');
@@ -134,6 +173,19 @@ function renderWhitelist(): string {
     '目标只能这样写（objective_kind）：deliver_item 交付道具 / has_item 只需持有 / talk_count 陪聊轮数 / affinity_at_least 好感达标。别的目标系统判不了，会被直接驳回。',
   );
   return lines.join('\n');
+}
+
+/** 印象工具的用法（好感度的涨法） */
+function renderImpressionGuide(): string {
+  return [
+    '【怎么让我对你更有好感（note_impression）】',
+    '判断这一轮对方说的话：',
+    '- pleased：说到你心坎里、正合你在意的事（+2 好感度）',
+    '- neutral：不咸不淡（不加不减，通常不必调用）',
+    '- offended：踩了你的忌讳（-1 好感度；**这一条不受冷却限制**，说错话立刻有代价）',
+    `同一套恭维第二次不再新鲜：同一件事反复夸，系统会按冷却驳回（每 ${IMPRESSION_COOLDOWN_ROUNDS} 轮最多因印象涨一次），别白白浪费工具调用。`,
+    '调用时把缘由写进 reason（一两句），那是你自己心里的记账。',
+  ].join('\n');
 }
 
 function renderRuling(ruling: QuestRuling | null): string | null {
@@ -182,9 +234,11 @@ export function buildNpcSystemPrompt(
     NPC_PERSONA_PROMPT,
     renderIdentity(npc),
     renderOwnBag(npc),
+    renderTastes(npc),
     renderOwnQuests(world, npc),
     renderRelationship(world, npc),
     renderWhitelist(),
+    renderImpressionGuide(),
   ];
   const ruling = renderRuling(lastRuling);
   if (ruling) sections.push(ruling);

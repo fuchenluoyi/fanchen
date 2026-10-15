@@ -30,6 +30,7 @@ export const QUEST_ACTION_LABEL: Record<QuestRulingAction, string> = {
   submit_quest: '交付结算',
   decline_quest: '婉拒委托',
   accept_quest: '接取委托',
+  note_impression: '记印象',
 };
 
 export const CATEGORY_LABEL: Record<TaskCategory, string> = {
@@ -57,6 +58,28 @@ export const CHANNEL_LABEL: Record<string, string> = {
   rule: '规则引擎',
   none: '未触发',
 };
+
+/** 玩家侧的失败抬头：拒绝码 → 一句人话（详细原因由裁决层给出，信息不丢） */
+const PLAYER_REJECTION_HEADLINE: Record<string, string> = {
+  player_item_insufficient: '你身上没有这件东西（或不够）',
+  deliver_mismatch: '要交的不是这件东西',
+  deliver_count_too_low: '数量不够',
+  deliver_required: '这条委托要交东西才能了结',
+  deliver_forbidden: '这条委托不用交东西',
+  objective_not_met: '条件还没达成',
+  quest_not_accepted: '这条委托不在进行中',
+  quest_not_submittable: '这条委托已经了结了',
+  quest_not_found: '找不到这条委托',
+};
+
+/**
+ * 把裁决层的拒绝拼成给**玩家**看的一句话。
+ * 玩家在界面上点按钮被拒时用它 —— 拒绝绝不静默，且要说清是哪一条、为什么。
+ */
+export function playerQuestRejectionText(code: string | null, detail: string): string {
+  const headline = PLAYER_REJECTION_HEADLINE[code ?? ''] ?? '没能完成';
+  return `${headline}：${detail}`;
+}
 
 export function formatTime(timestamp: number): string {
   const date = new Date(timestamp);

@@ -9,9 +9,9 @@
  *
  * 本模块不碰网络、不碰 localStorage、不碰 React。
  */
-import { acceptQuest, declineQuest, proposeQuest, submitQuest } from './adjudicate.ts';
+import { acceptQuest, declineQuest, noteImpression, proposeQuest, submitQuest } from './adjudicate.ts';
 import type { ProposeQuestInput } from './adjudicate.ts';
-import type { Adjudication, ItemStack, World } from './types.ts';
+import type { Adjudication, ImpressionKind, ItemStack, World } from './types.ts';
 
 /**
  * 模型提案的载荷：形状与领域层入参一致，但**不含 npcId** ——
@@ -29,7 +29,12 @@ export type QuestChannelEvent =
   | { type: 'quest_submit'; submission: { questId: string; deliver?: ItemStack } }
   | { type: 'quest_decline'; decline: { questId: string; reason?: string } };
 
-export type QuestRulingAction = 'propose_quest' | 'submit_quest' | 'decline_quest' | 'accept_quest';
+export type QuestRulingAction =
+  | 'propose_quest'
+  | 'submit_quest'
+  | 'decline_quest'
+  | 'accept_quest'
+  | 'note_impression';
 
 /** 一条裁决事实：界面展示它，提示词回注它 */
 export interface QuestRuling {
@@ -157,4 +162,42 @@ export function applyPlayerDecline(
     now: ctx.now,
   });
   return { world: result.world, ruling: toRuling('decline_quest', result, ctx.now, ctx.questId) };
+}
+
+/**
+ * 玩家在界面上点【交付 / 请对方验看】：同样走裁决层提交。
+ * 交付型目标要带 deliver；非交付型（has_item / talk_count / affinity_at_least）不要带 ——
+ * 带了会被裁决层以 deliver_forbidden 拒绝。
+ *
+ * 界面**不替裁决层做判断**：玩家手上不够也允许点，拒绝就走裁决并作为事实回注。
+ */
+export function applyPlayerSubmit(
+  world: World,
+  ctx: QuestTurnContext & { questId: string; deliver?: ItemStack },
+): QuestTurnOutcome {
+  const result = submitQuest(world, {
+    requestId: ctx.requestId,
+    questId: ctx.questId,
+    ...(ctx.deliver ? { deliver: ctx.deliver } : {}),
+    now: ctx.now,
+  });
+  return { world: result.world, ruling: toRuling('submit_quest', result, ctx.now, ctx.questId) };
+}
+
+/**
+ * 记一次印象（好感度的涨法）：模型判断「这一轮说到心坎里 / 冒犯了她」。
+ * 计分、冷却、下限都在裁决层；这里只做接线。
+ */
+export function applyQuestImpression(
+  world: World,
+  ctx: QuestTurnContext & { npcId: string; impression: ImpressionKind; reason?: string },
+): QuestTurnOutcome {
+  const result = noteImpression(world, {
+    requestId: ctx.requestId,
+    npcId: ctx.npcId,
+    impression: ctx.impression,
+    ...(ctx.reason ? { reason: ctx.reason } : {}),
+    now: ctx.now,
+  });
+  return { world: result.world, ruling: toRuling('note_impression', result, ctx.now, null) };
 }
