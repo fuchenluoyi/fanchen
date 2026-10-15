@@ -10,6 +10,7 @@ import {
   QUEST_TOOLS,
   mapQuestToolCall,
   normalizeQuestDecline,
+  normalizeQuestImpression,
   normalizeQuestProposal,
   normalizeQuestSubmission,
 } from '../server/lib/quest-tools.mjs';
@@ -36,16 +37,24 @@ function proposal(overrides: Record<string, unknown> = {}): Record<string, unkno
 }
 
 describe('工具定义', () => {
-  it('三个工具都是提案，没有一个是执行', () => {
+  it('四个工具都是提案，没有一个是执行', () => {
     assert.deepEqual(
       QUEST_TOOLS.map((tool) => tool.function.name),
       QUEST_TOOL_NAMES,
     );
+    assert.equal(QUEST_TOOLS.length, 4);
+    assert.ok(QUEST_TOOL_NAMES.includes('note_impression'));
     for (const tool of QUEST_TOOLS) {
       assert.ok(tool.function.description.length > 10, `${tool.function.name} 缺少可读描述`);
       assert.ok(Array.isArray(tool.function.parameters.required));
       assert.equal(tool.function.parameters.type, 'object');
     }
+  });
+
+  it('propose_quest 不再让模型自报档位（offer_level 已从参数里去掉）', () => {
+    const propose = QUEST_TOOLS.find((tool) => tool.function.name === 'propose_quest');
+    assert.ok(propose);
+    assert.equal('offer_level' in propose.function.parameters.properties, false);
   });
 
   it('propose_quest 明确禁止模型自己决定收没收到东西（写进 submit_quest 描述）', () => {
@@ -109,16 +118,14 @@ describe('propose_quest 归一化', () => {
     assert.equal(normalizeQuestProposal([]).ok, false);
   });
 
-  it('offer_level 可选，越界则拒绝', () => {
+  it('提案里不再有 offerLevel：模型就算传了也被忽略（档位由代码算）', () => {
     const without = normalizeQuestProposal(proposal());
     assert.equal(without.ok, true);
     if (without.ok) assert.equal('offerLevel' in without.proposal, false);
 
     const withLevel = normalizeQuestProposal(proposal({ offer_level: 3 }));
     assert.equal(withLevel.ok, true);
-    if (withLevel.ok) assert.equal(withLevel.proposal.offerLevel, 3);
-
-    assert.match(reasonOf(normalizeQuestProposal(proposal({ offer_level: 0 }))), /offer_level/);
+    if (withLevel.ok) assert.equal('offerLevel' in withLevel.proposal, false);
   });
 
   it('职责边界：未登记的道具 id 在这里**照样通过**，留给前端裁决层去拒', () => {
@@ -161,8 +168,35 @@ describe('submit_quest / decline_quest 归一化', () => {
   });
 });
 
+describe('note_impression 归一化', () => {
+  it('三种印象都能收敛，理由可选', () => {
+    const pleased = normalizeQuestImpression({ impression: 'pleased', reason: '他记得我旧疾' });
+    assert.equal(pleased.ok, true);
+    if (pleased.ok) assert.deepEqual(pleased.impression, { kind: 'pleased', reason: '他记得我旧疾' });
+
+    const neutral = normalizeQuestImpression({ impression: 'neutral' });
+    assert.equal(neutral.ok, true);
+    if (neutral.ok) assert.deepEqual(neutral.impression, { kind: 'neutral' });
+
+    const offended = normalizeQuestImpression({ kind: 'offended' });
+    assert.equal(offended.ok, true);
+    if (offended.ok) assert.equal(offended.impression.kind, 'offended');
+  });
+
+  it('缺印象或瞎写会被拒，理由过长截断', () => {
+    assert.match(reasonOf(normalizeQuestImpression({})), /impression/);
+    assert.match(reasonOf(normalizeQuestImpression({ impression: '很感动' })), /impression/);
+    assert.equal(normalizeQuestImpression(null).ok, false);
+    assert.equal(normalizeQuestImpression([]).ok, false);
+
+    const long = normalizeQuestImpression({ impression: 'offended', reason: '话'.repeat(500) });
+    assert.equal(long.ok, true);
+    if (long.ok) assert.equal(long.impression.reason.length, 200);
+  });
+});
+
 describe('工具调用派发', () => {
-  it('三个工具分别映射成对应事件', () => {
+  it('四个工具分别映射成对应事件', () => {
     const propose = mapQuestToolCall('propose_quest', proposal());
     assert.equal(propose.ok, true);
     if (propose.ok) assert.equal(propose.event.type, 'quest_proposal');
@@ -174,6 +208,19 @@ describe('工具调用派发', () => {
     const decline = mapQuestToolCall('decline_quest', { quest_id: 'quest-1' });
     assert.equal(decline.ok, true);
     if (decline.ok) assert.equal(decline.event.type, 'quest_decline');
+
+    const impression = mapQuestToolCall('note_impression', { impression: 'pleased' });
+    assert.equal(impression.ok, true);
+    if (impression.ok) {
+      assert.equal(impression.event.type, 'quest_impression');
+      assert.deepEqual(impression.event.impression, { kind: 'pleased' });
+    }
+  });
+
+  it('印象参数不合法时派发失败（调用方会转成 notice）', () => {
+    const bad = mapQuestToolCall('note_impression', { impression: '' });
+    assert.equal(bad.ok, false);
+    if (!bad.ok) assert.match(bad.reason, /impression/);
   });
 
   it('归一化失败与未知工具都返回 ok:false 与原因', () => {

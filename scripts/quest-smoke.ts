@@ -138,10 +138,15 @@ function main(): void {
     }),
     'npc_has_open_quest',
   );
-  expectRejected(
-    '小事给不起百年灵芝（档位上限）',
-    proposeQuest(world, {
-      requestId: 'smoke-reject-3',
+  /* 规则变更演示（第四轮）：道具奖励不再有档位价值上限 ——
+     **有守恒的不设数值上限，没有守恒的才设**（好感度仍受档位约束）。
+     用一个独立世界演示，不污染主线（主线里苏晚照手上还挂着任务）。 */
+  const tradeWorld = createWorld();
+  const lingzhiTotal = worldTotalOf(tradeWorld, 'century-lingzhi');
+  const generous = expectOk(
+    '小事也能把百年灵芝许出去（道具无价值上限，背包即上限）',
+    proposeQuest(tradeWorld, {
+      requestId: 'smoke-generous-1',
       npcId: 'su-wanzhao',
       title: '小事一桩',
       want: '帮我把药碾子挪一挪',
@@ -150,7 +155,11 @@ function main(): void {
       reward: { kind: 'item', itemId: 'century-lingzhi', count: 1 },
       now: 1300,
     }),
-    'reward_over_cap',
+  );
+  assert.equal(
+    worldTotalOf(generous.world, 'century-lingzhi'),
+    lingzhiTotal,
+    '道具奖励只是从「可用」挪进「已预留」，总量必须不变（守恒）',
   );
   expectRejected(
     '所要之物就是奖励本身（自循环套利）',

@@ -5,18 +5,20 @@
  *   3. 存档容错：脏数据回到开局，绝不让页面白屏
  *   4. 事件 → 裁决的接线（含原子性、预留锁、npcId 由客户端决定）
  *   5. 客户端二次收敛：结构不对的服务端事件直接丢弃
+ *   6. 玩家在界面上交付/完成委托（走裁决层，拒绝码 → 玩家侧文案）
  */
 import { describe, it } from 'node:test';
 import assert from 'node:assert/strict';
 
 import { normalizeServerEvent, sanitizeQuestProposal } from '../src/lib/api.ts';
 import type { QuestProposalDraft, QuestRuling } from '../src/lib/quest/bridge.ts';
-import { applyPlayerAccept, applyQuestEvent } from '../src/lib/quest/bridge.ts';
+import { applyPlayerAccept, applyPlayerSubmit, applyQuestEvent } from '../src/lib/quest/bridge.ts';
 import { availableOf, auditInventory, totalOf } from '../src/lib/quest/inventory.ts';
 import { normalizeStoredWorld } from '../src/lib/quest/persist.ts';
 import { buildNpcSystemPrompt } from '../src/lib/quest/prompt.ts';
 import { auditWorld, createWorld, getNpc, getQuest, worldTotalOf } from '../src/lib/quest/world.ts';
 import { proposeQuest } from '../src/lib/quest/adjudicate.ts';
+import { playerQuestRejectionText } from '../src/lib/labels.ts';
 import {
   DEFAULT_QUEST_NPC_ID,
   DEFAULT_SETTINGS,
@@ -27,6 +29,7 @@ import {
   npcPersonaDraft,
 } from '../src/lib/settings.ts';
 import type { ChatMode } from '../src/types.ts';
+import type { World } from '../src/lib/quest/types.ts';
 
 /** 一条合法的模型提案（NPC 旧疾求药） */
 function proposal(overrides: Partial<QuestProposalDraft> = {}): QuestProposalDraft {
@@ -113,15 +116,57 @@ describe('设置：对话模式与出面 NPC', () => {
 /* ========================= 提示词：NPC 视角 ========================= */
 
 describe('npc 提示词：只给 NPC 自己的视角（ADR-013）', () => {
-  it('写清 NPC 是谁、它的背包、它的关系', () => {
+  it('写清 NPC 是谁、它的背包、它的关系（含关系阶段与说话分寸）', () => {
     const world = createWorld();
     const prompt = buildNpcSystemPrompt(world, 'su-wanzhao', null);
     assert.match(prompt, /苏晚照/);
     assert.match(prompt, /药庐女医/);
     assert.match(prompt, /我自己的背包/);
-    assert.match(prompt, /三七（id: sanqi）· 上品 · 单价 45 · ×2/);
+    assert.match(prompt, /三七（id: sanqi）· 上品 · 单价 45 · ×2 · 我舍不得给/);
     assert.match(prompt, /对方与我的关系/);
-    assert.match(prompt, /好感度：0/);
+    assert.match(prompt, /你们的关系：萍水（好感度 0，距「相识」还差 5）/);
+    assert.match(prompt, /累计说过：0 轮话/);
+    // 态度描述（提示词用的说话分寸）
+    assert.match(prompt, /说话分寸/);
+    assert.match(prompt, /过路的客人/);
+  });
+
+  it('喜好与忌讳、她在意的用途、舍不得给的 / 她多余的都写进了提示词', () => {
+    const prompt = buildNpcSystemPrompt(createWorld(), 'su-wanzhao', null);
+    assert.match(prompt, /我的偏好/);
+    assert.match(prompt, /我在意的用途：疗伤、补血、调和/);
+    assert.match(prompt, /我舍不得给的：[\s\S]*三七/);
+    assert.match(prompt, /我舍不得给的：[\s\S]*当归/);
+    assert.match(prompt, /我留着没用的：[\s\S]*百年灵芝/);
+    assert.match(prompt, /能救人的药材/); // likes
+    assert.match(prompt, /拿人命讨价还价/); // dislikes
+    // 叙事引导，不是规则 —— 必须写明系统不会因此驳回
+    assert.match(prompt, /不会\*\*因为"我舍不得"就驳回/);
+  });
+
+  it('关系阶段只影响态度，不设硬门闩（低阶段也能托付大事）', () => {
+    const prompt = buildNpcSystemPrompt(createWorld(), 'su-wanzhao', null);
+    assert.match(prompt, /事情能不能开口与阶段无关/);
+    // 阶段一律不出现在任何"驳回/不许"的句式里
+    assert.doesNotMatch(prompt, /阶段[^\n]*(驳回|不许|不能发布)/);
+  });
+
+  it('提示词里教了 note_impression 怎么用，并提醒同一套恭维会冷却', () => {
+    const prompt = buildNpcSystemPrompt(createWorld(), 'su-wanzhao', null);
+    assert.match(prompt, /note_impression/);
+    assert.match(prompt, /pleased/);
+    assert.match(prompt, /offended/);
+    assert.match(prompt, /第二次不再新鲜/);
+    assert.match(prompt, /每 2 轮最多因印象涨一次/);
+  });
+
+  it('道具奖励不再宣称有档位价值上限（有守恒的不设上限）', () => {
+    const prompt = buildNpcSystemPrompt(createWorld(), 'su-wanzhao', null);
+    assert.match(prompt, /没有价值上限/);
+    assert.match(prompt, /背包即上限/);
+    assert.match(prompt, /好感度：1 薄礼 档最多 \+3/);
+    assert.doesNotMatch(prompt, /道具价值 ≤ 20/);
+    assert.match(prompt, /不用自报档位/);
   });
 
   it('**不含玩家背包**：玩家独有的数量不会出现在提示词里', () => {
@@ -137,7 +182,7 @@ describe('npc 提示词：只给 NPC 自己的视角（ADR-013）', () => {
     const prompt = buildNpcSystemPrompt(createWorld(), 'su-wanzhao', null);
     assert.match(prompt, /凡品（值 1-5）：/);
     assert.match(prompt, /上品（值 21-80）：/);
-    assert.match(prompt, /三七\(sanqi, 值45\)/);
+    assert.match(prompt, /三七\(sanqi, 值45，用途疗伤\/材料\)/);
     assert.match(prompt, /绝品（值 301-1000）：/);
     assert.match(prompt, /结缘\(jieyuan\)/);
   });
@@ -253,6 +298,48 @@ describe('世界存档容错：脏数据不得白屏', () => {
     assert.equal(getNpc(restored, 'su-wanzhao')?.inventory.holds.length, 1);
     assert.equal(availableOf(getNpc(restored, 'su-wanzhao')!.inventory, 'jinchuang-gao'), 1);
     assert.equal(getQuest(restored, 'quest-1')?.provenance.sourceDialogueId, 'msg-1');
+  });
+
+  it('关系峰值与印象冷却记账能存回来（脏值不制造假冷却）', () => {
+    const world = createWorld();
+    world.player.affinity['su-wanzhao'] = 18;
+    world.player.stagePeak['su-wanzhao'] = 2;
+    world.player.impressionGainAt['su-wanzhao'] = 7;
+    const restored = normalizeStoredWorld(clone(world));
+    assert.equal(restored.player.affinity['su-wanzhao'], 18);
+    assert.equal(restored.player.stagePeak['su-wanzhao'], 2);
+    assert.equal(restored.player.impressionGainAt['su-wanzhao'], 7);
+
+    const dirty = normalizeStoredWorld({
+      player: {
+        stagePeak: { 'su-wanzhao': 99, 'lu-xingzhou': 'x' },
+        impressionGainAt: { 'su-wanzhao': 'y', 'lu-xingzhou': 3 },
+      },
+    });
+    assert.equal(dirty.player.stagePeak['su-wanzhao'], 4); // 越界夹到最高档
+    assert.equal(dirty.player.stagePeak['lu-xingzhou'], undefined);
+    assert.equal(dirty.player.impressionGainAt['lu-xingzhou'], 3);
+    // 字符串脏值必须丢掉：退化成 0 会凭空冷却 2 轮
+    assert.equal(dirty.player.impressionGainAt['su-wanzhao'], undefined);
+  });
+
+  it('印象事件（questId 为 null）也能存回来', () => {
+    const restored = normalizeStoredWorld({
+      events: [
+        {
+          id: 'event-1',
+          at: 5,
+          type: 'impression_noted',
+          questId: null,
+          npcId: 'su-wanzhao',
+          detail: '说到心坎里：他记得我旧疾',
+        },
+      ],
+    });
+    assert.equal(restored.events.length, 1);
+    assert.equal(restored.events[0]?.type, 'impression_noted');
+    assert.equal(restored.events[0]?.questId, null);
+    assert.match(restored.events[0]?.detail ?? '', /说到心坎里/);
   });
 
   it('结构有问题的预留被丢弃，合法预留照常恢复（可用 + 预留 = 拥有量）', () => {
@@ -498,5 +585,141 @@ describe('客户端事件收敛', () => {
     });
     assert.equal(event?.type, 'quest_proposal');
     assert.equal(normalizeServerEvent({ type: 'quest_proposal', proposal: { title: 'x' } }), null);
+  });
+});
+
+/* ================= 玩家在界面上交付 / 完成（A） ================= */
+
+describe('玩家在界面上交付 / 完成（走裁决层）', () => {
+  /** 造一条「已接取」的委托：发布 → 接取 */
+  function setup(base: World, overrides: Partial<QuestProposalDraft> = {}): { world: World; questId: string } {
+    const proposed = applyQuestEvent(
+      base,
+      { type: 'quest_proposal', proposal: proposal(overrides) },
+      { npcId: 'su-wanzhao', requestId: 'req-1', dialogueId: 'msg-1', now: 1 },
+    );
+    assert.equal(proposed.ruling.ok, true, `提案应通过，实际被拒：${proposed.ruling.code ?? ''}`);
+    const questId = proposed.ruling.questId ?? '';
+    const accepted = applyPlayerAccept(proposed.world, { questId, requestId: 'req-2', now: 2 });
+    assert.equal(accepted.ruling.ok, true, `接取应通过，实际被拒：${accepted.ruling.code ?? ''}`);
+    return { world: accepted.world, questId };
+  }
+
+  it('拒绝码 → 玩家侧文案：有抬头、有明细、未知码有兜底', () => {
+    assert.equal(
+      playerQuestRejectionText('player_item_insufficient', '玩家只有 1 份「三七」，需要 2 份'),
+      '你身上没有这件东西（或不够）：玩家只有 1 份「三七」，需要 2 份',
+    );
+    assert.match(playerQuestRejectionText('objective_not_met', '目标尚未达成'), /条件还没达成/);
+    assert.match(playerQuestRejectionText('quest_not_submittable', '这个委托已经结算过了'), /已经了结/);
+    assert.match(playerQuestRejectionText('deliver_forbidden', '这个委托不需要提交道具'), /不用交东西/);
+    assert.match(playerQuestRejectionText(null, '明细'), /没能完成：明细/);
+    assert.match(playerQuestRejectionText('没见过的码', '明细'), /没能完成：明细/);
+  });
+
+  it('交付型：按钮把 objective 里的道具与数量交出去 → 扣除、发奖、结算、守恒', () => {
+    const base = createWorld({ playerInventory: [{ itemId: 'sanqi', count: 2 }] });
+    const sanqiBefore = worldTotalOf(base, 'sanqi');
+    const gaoBefore = worldTotalOf(base, 'jinchuang-gao');
+    const { world, questId } = setup(base);
+
+    const outcome = applyPlayerSubmit(world, {
+      questId,
+      requestId: 'req-3',
+      now: 3,
+      deliver: { itemId: 'sanqi', count: 1 },
+    });
+    assert.equal(outcome.ruling.ok, true);
+    assert.equal(outcome.ruling.action, 'submit_quest');
+    assert.equal(outcome.ruling.code, null);
+    assert.equal(getQuest(outcome.world, questId)?.status, 'settled');
+    // 交出一份三七，拿到一份金疮药
+    assert.equal(availableOf(outcome.world.player.inventory, 'sanqi'), 1);
+    assert.equal(availableOf(outcome.world.player.inventory, 'jinchuang-gao'), 1);
+    // 守恒 + 无残留预留
+    assert.equal(worldTotalOf(outcome.world, 'sanqi'), sanqiBefore);
+    assert.equal(worldTotalOf(outcome.world, 'jinchuang-gao'), gaoBefore);
+    assert.equal(getNpc(outcome.world, 'su-wanzhao')?.inventory.holds.length, 0);
+    assert.deepEqual(auditWorld(outcome.world), []);
+  });
+
+  it('交付型但手上不够：拒绝码 + 可读文案，世界与入参同一引用（原子）', () => {
+    const { world, questId } = setup(createWorld(), {
+      objective: { kind: 'deliver_item', itemId: 'sanqi', count: 2 }, // 玩家只有 1 份
+    });
+    const before = JSON.stringify(world);
+    const failed = applyPlayerSubmit(world, {
+      questId,
+      requestId: 'req-3',
+      now: 3,
+      deliver: { itemId: 'sanqi', count: 2 },
+    });
+    assert.equal(failed.ruling.ok, false);
+    assert.equal(failed.ruling.code, 'player_item_insufficient');
+    assert.equal(failed.world, world);
+    assert.equal(JSON.stringify(failed.world), before);
+    assert.match(playerQuestRejectionText(failed.ruling.code, failed.ruling.message), /你身上没有这件东西/);
+    // 委托还挂在「已接取」，玩家凑齐了可以再点
+    assert.equal(getQuest(world, questId)?.status, 'accepted');
+  });
+
+  it('非交付型：不带 deliver 提交；未达成 objective_not_met，达成后结算', () => {
+    const { world, questId } = setup(createWorld(), {
+      tier: 3,
+      objective: { kind: 'talk_count', rounds: 3 },
+      reward: { kind: 'ability', abilityId: 'jieyuan' },
+    });
+    const tooEarly = applyPlayerSubmit(world, { questId, requestId: 'req-3', now: 3 });
+    assert.equal(tooEarly.ruling.ok, false);
+    assert.equal(tooEarly.ruling.code, 'objective_not_met');
+    assert.match(playerQuestRejectionText(tooEarly.ruling.code, tooEarly.ruling.message), /条件还没达成/);
+
+    world.player.talks['su-wanzhao'] = 3; // 模拟「聊够了」——轮数由对话记账
+    const done = applyPlayerSubmit(world, { questId, requestId: 'req-4', now: 4 });
+    assert.equal(done.ruling.ok, true);
+    assert.equal(getQuest(done.world, questId)?.status, 'settled');
+    assert.deepEqual(done.world.player.abilities, ['jieyuan']);
+  });
+
+  it('非交付型夹带 deliver 会被拒（deliver_forbidden），不带就能过', () => {
+    const { world, questId } = setup(createWorld(), {
+      tier: 1,
+      objective: { kind: 'has_item', itemId: 'gancao', count: 2 },
+      reward: { kind: 'affinity', amount: 2 },
+    });
+    const withItem = applyPlayerSubmit(world, {
+      questId,
+      requestId: 'req-3',
+      now: 3,
+      deliver: { itemId: 'gancao', count: 2 },
+    });
+    assert.equal(withItem.ruling.ok, false);
+    assert.equal(withItem.ruling.code, 'deliver_forbidden');
+
+    const plain = applyPlayerSubmit(world, { questId, requestId: 'req-4', now: 4 });
+    assert.equal(plain.ruling.ok, true);
+    // 持有型目标不消耗道具
+    assert.equal(availableOf(plain.world.player.inventory, 'gancao'), 2);
+  });
+
+  it('已经了结的委托再点一次：quest_not_submittable', () => {
+    const { world, questId } = setup(createWorld({ playerInventory: [{ itemId: 'sanqi', count: 2 }] }));
+    const first = applyPlayerSubmit(world, {
+      questId,
+      requestId: 'req-3',
+      now: 3,
+      deliver: { itemId: 'sanqi', count: 1 },
+    });
+    assert.equal(first.ruling.ok, true);
+
+    const again = applyPlayerSubmit(first.world, {
+      questId,
+      requestId: 'req-4',
+      now: 4,
+      deliver: { itemId: 'sanqi', count: 1 },
+    });
+    assert.equal(again.ruling.ok, false);
+    assert.equal(again.ruling.code, 'quest_not_submittable');
+    assert.match(playerQuestRejectionText(again.ruling.code, again.ruling.message), /已经了结/);
   });
 });

@@ -106,21 +106,30 @@ describe('发布委托', () => {
 });
 
 describe('奖励的档位裁决', () => {
-  it('超过档位价值上限的奖励被拒（小事给不起百年灵芝）', () => {
+  it('道具奖励不再按价值驳回：小事也拿得出百年灵芝（有守恒，只挪位置）', () => {
     const world = createWorld();
+    const before = worldTotalOf(world, 'century-lingzhi');
     const result = proposeQuest(
       world,
       propose({ tier: 1, reward: { kind: 'item', itemId: 'century-lingzhi', count: 1 } }),
     );
-    assert.equal(result.ok, false);
-    if (!result.ok) assert.equal(result.code, 'reward_over_cap');
+    assert.equal(result.ok, true);
+    if (!result.ok) return;
+    // 只是被预留锁住：总量不变，可用 -1
+    assert.equal(worldTotalOf(result.world, 'century-lingzhi'), before);
+    assert.equal(getNpc(result.world, 'su-wanzhao')?.inventory.holds.length, 1);
   });
 
-  it('模型自报的档位不能超过代码算出的上限', () => {
+  it('档位由代码算：模型没有自报的口子（小事 → 薄礼）', () => {
     const world = createWorld();
-    const result = proposeQuest(world, propose({ tier: 1, offerLevel: 3 }));
-    assert.equal(result.ok, false);
-    if (!result.ok) assert.equal(result.code, 'reward_over_cap');
+    const result = proposeQuest(
+      world,
+      propose({ tier: 1, reward: { kind: 'item', itemId: 'gancao', count: 1 } }),
+    );
+    assert.equal(result.ok, true);
+    if (!result.ok) return;
+    // 苏晚照 generosity 0.6 + 小事 → maxOfferLevel = 1
+    assert.equal(result.quest?.offerLevel, 1);
   });
 
   it('NPC 背包空了就发不出任务（天然的奖励闸门）', () => {
