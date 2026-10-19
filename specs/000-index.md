@@ -54,6 +54,8 @@
 | 第三轮：委托工具通道 | ✅ 服务端已完成（T9，见 008 §12） |
 | 第四轮：前端接入界面 | ✅ 已完成（T10；`npc` 模式为默认，`desk` 模式原样保留） |
 | 第五轮：交付动作 / 独立会话 / 道具与关系阶段 / 印象 | ✅ 已完成（T11，见 008 §12） |
+| 第六轮：玩家背包 / 赠送 / 交付事实 | ✅ 已完成（T12，见 008 §13；`desk` 模式与既有链路未动） |
+| 第七轮：人格分槽 / 行囊补齐 / 重置 / 留言 / 谢礼清单 | ✅ 已完成（T13，见 008 §14） |
 
 **验证快照（第一轮）**：typecheck 零错误 · 单测 40/40 · 冒烟 10/10 · 渲染自检通过 · 产物 gzip 83.6 KB · `pnpm dev` 实测可用。
 
@@ -66,6 +68,12 @@
 
 **验证快照（第五轮 · 本轮实测）**：typecheck 零错误 · 全仓库单测 **183/183**（11 个文件：`dedupe` 8 · `extract` 8 · `rules` 6 · `server` 18 · `quest.domain` 37 · `quest.adjudicate` 24 · `quest.tools` 18 · `quest.relationship` 7 · `quest.impression` 11 · `quest.frontend` 41 · `threads` 5）· `node scripts/quest-smoke.ts` 通过（退出码 0）· `scripts/smoke.mjs` **10/10 通过** · 工作区无残留。
 ⚠️ 遗留：`render-check` 仍需在正常终端复跑（同第四轮）。
+
+**验证快照（第六轮 · 本轮实测）**：typecheck 零错误 · 全仓库单测 **195/195**（11 个文件；`quest.frontend` 由 41 → 53，新增开局背包 4 例 / 赠送 5 例 / 交付事实 3 例）· `node scripts/quest-smoke.ts` 通过（退出码 0）· `scripts/smoke.mjs` **10/10 通过**。
+⚠️ 本轮的「我的行囊」面板属于渲染层，沙箱内无法跑 `render-check`，**需在正常终端复跑** `npm run check:render`。
+
+**验证快照（第七轮 · 本轮实测）**：typecheck 零错误 · 全仓库单测 **204/204**（`quest.frontend` 由 53 → 62：人格分槽 2 例 / 谢礼清单 3 例 / 补齐行囊 3 例 / 留言 2 例）· `node scripts/quest-smoke.ts` 通过（退出码 0）· `scripts/smoke.mjs` **10/10 通过**。
+⚠️ 本轮改了设置面板与行囊面板，`render-check` **仍需在正常终端复跑**。
 
 ## 4. 需求 → 任务 → 测试 追溯矩阵
 
@@ -161,3 +169,36 @@
 | U-23 | `tests/quest.relationship.test.ts` | 五档阈值（0/5/15/30/60）、脏值容错、单向不回落、阶段进度、态度文案、**阶段不做硬门闩** |
 | U-24 | `tests/quest.impression.test.ts` | 印象计分（+2/0/−1）、冷却（2 轮，冒犯豁免）、好感度下限、幂等、原子性、事件流水，以及客户端接线与 `sanitizeQuestImpression` |
 | U-25 | `tests/quest.domain.test.ts` + `tests/threads.test.ts` | 主观估值推导（×3 / ×1 / ×0.5）、两张清单从背包推出、**只做叙事不做驳回**；每 NPC 一条独立会话的线索切分（互不污染、旧存档归需求台） |
+
+### 第六轮：玩家背包 / 赠送 / 交付事实（任务编号 T12，见 [008 §13](./008-npc-quest-domain.md)）
+
+| 需求 | 任务 | 测试 |
+| --- | --- | --- |
+| FR-026 玩家背包可见 | T12 | U-26 |
+| FR-027 赠送（白送道具） | T12 | U-27 |
+| FR-028 交付事实的权威来源 | T12 | U-28 |
+| NFR-013 叙事与裁决的边界（赠送路径同样适用） | T12 | U-27 |
+
+| 编号 | 位置 | 覆盖内容 |
+| --- | --- | --- |
+| U-26 | `tests/quest.frontend.test.ts` | 开局 32 件每件 ≥1、世界自检通过、玩家无预留；显式条目保持原量不重复；`completePlayerInventory` 不重复；显式背包仍可整份覆盖 |
+| U-27 | `tests/quest.frontend.test.ts` | 赠送扣减与转移、**守恒**、不产生委托、事件 `item_gifted`；幂等重放（世界同一引用）；不够被拒且世界逐字节不变；三个拒绝码；**NPC 不得以「用不上」拒收** |
+| U-28 | `tests/quest.frontend.test.ts` | 已结算委托的提示词写明「已经收到的货」与「已经了结」并禁止再催交付；未交付时不得出现该栏；提示词仍不含玩家背包 |
+
+### 第七轮：人格分槽 / 行囊补齐 / 重置 / 留言 / 谢礼清单（任务编号 T13，见 [008 §14](./008-npc-quest-domain.md)）
+
+| 需求 | 任务 | 测试 |
+| --- | --- | --- |
+| FR-029 人格补充按 NPC 分槽 | T13 | U-29 |
+| FR-030 行囊补齐（每件 64） | T13 | U-30 |
+| FR-031 重置对话与进度（保留设置） | T13 | U-31（`store.tsx` 胶水，typecheck + 代码复核） |
+| FR-032 结算后 NPC 留言 | T13 | U-32 |
+| FR-033 谢礼只能从自己背包挑 | T13 | U-33 |
+
+| 编号 | 位置 | 覆盖内容 |
+| --- | --- | --- |
+| U-29 | `tests/quest.frontend.test.ts` | 默认空、只认白名单 key、trim 去空；旧全局 `systemPrompt` 不迁移；补充只追加给那一位；`desk` 路径未变 |
+| U-30 | `tests/quest.frontend.test.ts` | 补到 64 且超量的不动；已满额时返回同一世界；幂等重放；事件 `items_restocked` |
+| U-31 | — | 只删对话/任务/世界三份数据、保留设置；属于 React 胶水，靠 typecheck 与代码复核 |
+| U-32 | `tests/quest.frontend.test.ts` | 留言含名字与收到的货、确定性；未结算没有留言 |
+| U-33 | `tests/quest.frontend.test.ts` | 苏晚照谢礼清单无竹哨；空背包提示「一件也拿不出来」；白名单改名；奖励被拒时给出「换一件重提」指引 |

@@ -262,8 +262,90 @@ offered ──accept──▶ accepted ──submit──▶ settled
 
 - `scripts/render-check.mjs` 在沙箱内跑不了（Vite 用 esbuild 打包配置需 spawn 子进程）：
   **需在正常终端复跑** `npm run check:render`，它是「一打开就白屏」的唯一自动防线。
-- `store.tsx` 的 React 胶水（`send` 的事件分支与收尾、印象「每轮只认第一条」、`deliverQuest` 的 dispatch 序列）
-  没有自动化测试：`node --test` 无法直接导入 `.tsx`，只能靠 typecheck 与 SSR 探针间接覆盖。
+- `store.tsx` 的 React 胶水（`send` 的事件分支与收尾、印象「每轮只认第一条」、`deliverQuest` / `giftQuest` 的
+  dispatch 序列）没有自动化测试：`node --test` 无法直接导入 `.tsx`，只能靠 typecheck 与 SSR 探针间接覆盖。
 - `World.processed`（幂等记录）与 `World.events`（事件流水）目前**无上限**，会随会话累积进 localStorage。
 - 委托面板的 NPC 背包默认折叠，SSR 探针点不开 → 面板里「舍不得给 / 多余」两个徽记
   只有数据层单测 + 代码复核，**无渲染级覆盖**。
+
+## 13. 第六轮：玩家背包 / 赠送 / 交付事实（T12）
+
+**玩家背包（FR-026）**
+
+- `world.ts` 新增 `completePlayerInventory(base)` 与 `STARTING_PLAYER_INVENTORY`：
+  以 `DEFAULT_PLAYER_INVENTORY`（三七 1 / 甘草 2 / 干粮 2）为显式条目，把**道具表全部 32 件**补齐到每件 ≥1；
+  同一件道具只出现一次，**不重复加**。`createWorld` 默认改用它。
+- 生效范围：**只改新世界（新存档）**，旧存档不做隐式补领 —— 补领由玩家自己决定。
+- 界面：`QuestPanel.PlayerBagPanel`「我的行囊」按珍贵等级由低到高列全量，显示持有量、零持有置灰，
+  位置在「需求清单」空态提示下方（`TaskPanel.tsx`）。读 `player.inventory` 属玩家视角，**不注入提示词**。
+
+**赠送（FR-027）**
+
+- 裁决层新增 `giftItem(world, { requestId, npcId, itemId, count, now? })`：幂等 / 原子 / **只做转移**；
+  `Applied.quest` 恒为 `null`，不产生委托、不改委托状态。
+- 拒绝码 `invalid_gift_count`（新增）、`unknown_item`、`unknown_npc`、`player_item_insufficient`、
+  `idempotency_key_reused`；事件 `item_gifted`（`questId = null`）。
+- **NPC 不得以「用不上」为由拒收**（NFR-013 / ADR-016）：收礼不破坏守恒，主观估值只进叙事。
+  这一点与 `submitQuest` 的根本差别：赠送不需要目标、不结算任何承诺。
+- 接线：`bridge.applyPlayerGift` → `store.giftQuest(npcId, itemId, count)`；界面在行囊每行给【送给他】，
+  失败用玩家侧文案（拒绝绝不静默）。送礼后道具进入 NPC 背包的「可用」，**可以再被它当作谢礼发出去**。
+
+**交付事实（FR-028，修「NPC 说没收到东西」）**
+
+- `prompt.renderQuestLine` 增加两栏，全部**现算**：
+  - `· 已经收到的货：甘草 ×1（已入我手，不必再向对方讨要）` ← 来自 `Quest.delivered`；
+  - `· **这条委托已经了结**：绝不能再让他交付一次，也不要问「东西呢」「我还没见着」` ← `status === 'settled'`。
+  在此之前该栏**从未被渲染**，NPC 只看到「目标：交付甘草×1」，于是反复催货。
+- `store.tsx` 收尾：本轮没有新裁决时，**继续回注最近一次成功的裁决事实**；拒绝仍只活一轮。
+  否则界面按钮交付的事实下一轮即被无条件清空，NPC 就"忘了自己收过"。
+
+**验证**：typecheck 零错误 · 全仓库单测 **195/195**（11 个文件，本轮 +12）·
+`node scripts/quest-smoke.ts` 通过（退出码 0）· `scripts/smoke.mjs` **10/10 通过**。
+
+**遗留**
+
+- `render-check` 仍需在正常终端复跑（同第四/五轮）。
+- 旧存档不会自动补齐 32 件；如果需要"补领"入口，得另开一条迁移（未做）。
+
+## 14. 第七轮：人格分槽 / 行囊补齐 / 重置 / 留言 / 谢礼清单（T13）
+
+**人格补充按 NPC（FR-029）**
+
+- `Settings.npcPersonas: Record<string, string>`；`normalizePersonas` 只认 `NPC_IDS` 三位、trim 后去空。
+- **旧全局 `systemPrompt` 不迁移**（一段设定会串到三个人身上），由玩家在设置里按 NPC 重填。
+- 设置界面：三个 NPC 按钮切换，textarea 只编辑当前那一位；「清空」只清当前那一位。
+- `store.send` 取 `npcPersonaFor(settings, settings.questNpcId)` 传给 `buildNpcSystemPrompt`。
+- `desk` 模式的 `systemPrompt` 路径一字未改。
+
+**行囊补齐（FR-030）**
+
+- `adjudicate.restockPlayerInventory`：每件补到 `RESTOCK_TARGET = 64`，**只补缺口**（已 ≥64 不动），
+  幂等；没有缺口时返回同一个世界。它**故意不守恒**（世界补给 ≠ 玩家↔NPC 转移），单独成操作。
+- 事件 `items_restocked`；动作文案「补齐行囊」；行囊面板头部按钮触发。
+
+**重置对话与进度（FR-031）**
+
+- `store.resetConversation`：删 `messages` / `tasks` / `quest` 三份数据，**保留 `settings`**（含 API Key）。
+- 与「清空全部本地数据」并列在设置底部，文案写清差别。
+
+**NPC 留言（FR-032）**
+
+- `src/lib/quest/letter.ts` 的 `questLetter(quest, npc)`：确定性文案（不调模型），
+  含名字、收到的货、按轻重与奖励类型各一句话；只有 `settled` 才有。
+- 结算时（`deliverQuest` 与对话内 `submit_quest` 两条路径）追加到该 NPC 的对话线索；
+  重放（`applied` 为空）不重复追加；委托卡同步显示。
+
+**谢礼清单（FR-033，修「苏晚照许诺竹哨」）**
+
+- 白名单改名为【道具 id 拼写表】，明示**不是**能拿出的东西的清单。
+- 新增 `buildRewardMenu(npc)`【我能拿出的谢礼】：从 `listAvailable` 现算、带数量；空背包直接说「一件也拿不出来」。
+- 奖励被拒（`reward_not_owned` / `npc_reward_unavailable`）时，裁决事实补「换一件拿得出的、重新调用 `propose_quest`」，
+  否则她会反复重复同一条空头承诺。
+
+**验证**：typecheck 零错误 · 全仓库单测 **204/204**（11 个文件，本轮 +9）·
+`node scripts/quest-smoke.ts` 通过（退出码 0）· `scripts/smoke.mjs` **10/10 通过**。
+
+**遗留**
+
+- `render-check` 仍需在正常终端复跑（本轮改了设置面板与行囊面板）。
+- 补齐行囊是**补给**而非转移，若以后要做"经济平衡"，得给它加冷却或限制档位。
