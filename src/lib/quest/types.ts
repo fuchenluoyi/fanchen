@@ -243,7 +243,11 @@ export type QuestEventType =
   | 'reward_granted'
   | 'reward_released'
   | 'quest_settled'
-  | 'impression_noted';
+  | 'impression_noted'
+  /** 赠送：玩家白送道具给 NPC（不属于任何委托，questId 为 null） */
+  | 'item_gifted'
+  /** 行囊补齐：把玩家每件道具补到目标数量（**世界初始化便利，非守恒操作**） */
+  | 'items_restocked';
 
 export interface QuestEvent {
   id: string;
@@ -303,7 +307,8 @@ export type QuestErrorCode =
   | 'objective_not_met'
   | 'insufficient_items'
   | 'invalid_impression'
-  | 'impression_cooldown';
+  | 'impression_cooldown'
+  | 'invalid_gift_count';
 
 /** 领域错误：只带拒绝码与面向人的说明，不带栈语义 */
 export class QuestError extends Error {

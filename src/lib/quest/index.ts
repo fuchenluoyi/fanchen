@@ -19,4 +19,5 @@ export * from './rewards.ts';
 export * from './objectives.ts';
 export * from './world.ts';
 export * from './relationship.ts';
+export * from './letter.ts';
 export * from './adjudicate.ts';

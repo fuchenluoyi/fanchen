@@ -9,7 +9,15 @@
  *
  * 本模块不碰网络、不碰 localStorage、不碰 React。
  */
-import { acceptQuest, declineQuest, noteImpression, proposeQuest, submitQuest } from './adjudicate.ts';
+import {
+  acceptQuest,
+  declineQuest,
+  giftItem,
+  noteImpression,
+  proposeQuest,
+  restockPlayerInventory,
+  submitQuest,
+} from './adjudicate.ts';
 import type { ProposeQuestInput } from './adjudicate.ts';
 import type { Adjudication, ImpressionKind, ItemStack, World } from './types.ts';
 
@@ -34,7 +42,9 @@ export type QuestRulingAction =
   | 'submit_quest'
   | 'decline_quest'
   | 'accept_quest'
-  | 'note_impression';
+  | 'note_impression'
+  | 'gift_item'
+  | 'restock_player';
 
 /** 一条裁决事实：界面展示它，提示词回注它 */
 export interface QuestRuling {
@@ -200,4 +210,42 @@ export function applyQuestImpression(
     now: ctx.now,
   });
   return { world: result.world, ruling: toRuling('note_impression', result, ctx.now, null) };
+}
+
+/**
+ * 玩家在界面上点【送给他】：白送一件道具给 NPC（与委托无关）。
+ *
+ * 跟 `applyPlayerSubmit` 的区别：这里**不经过委托**，所以委托状态、预留锁都不动；
+ * 但同样走裁决层 —— 够不够、道具在不在白名单里，都由代码判定。
+ */
+export function applyPlayerGift(
+  world: World,
+  ctx: QuestTurnContext & { npcId: string; itemId: string; count: number },
+): QuestTurnOutcome {
+  const result = giftItem(world, {
+    requestId: ctx.requestId,
+    npcId: ctx.npcId,
+    itemId: ctx.itemId,
+    count: ctx.count,
+    now: ctx.now,
+  });
+  return { world: result.world, ruling: toRuling('gift_item', result, ctx.now, null) };
+}
+
+/**
+ * 玩家点【补齐行囊】：把每件道具补到目标数量（默认 64）。
+ *
+ * 这是**世界补给**，不是转移 —— 它故意不守恒（见 adjudicate 里的说明）。
+ * 已经够数的道具不动，所以反复点击不会越补越多。
+ */
+export function applyPlayerRestock(
+  world: World,
+  ctx: QuestTurnContext & { target?: number },
+): QuestTurnOutcome {
+  const result = restockPlayerInventory(world, {
+    requestId: ctx.requestId,
+    ...(ctx.target !== undefined ? { target: ctx.target } : {}),
+    now: ctx.now,
+  });
+  return { world: result.world, ruling: toRuling('restock_player', result, ctx.now, null) };
 }

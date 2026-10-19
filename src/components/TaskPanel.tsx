@@ -1,7 +1,7 @@
 import { useMemo, useState } from 'react';
 import { useStore } from '../state/store.tsx';
 import { CandidateCard } from './CandidateCard.tsx';
-import { QuestPanel } from './QuestPanel.tsx';
+import { PlayerBagPanel, QuestPanel } from './QuestPanel.tsx';
 import { TaskItem } from './TaskItem.tsx';
 import { CHANNEL_LABEL, formatTime } from '../lib/labels.ts';
 import type { TaskStatus } from '../types.ts';
@@ -37,6 +37,9 @@ export function TaskPanel() {
   }, [state.tasks, filter, sortByPriority]);
 
   const latestAudit = state.audits[0];
+
+  // 行囊里的「送给他」要知道送给谁：跟委托区同一位 NPC
+  const npcName = state.world.npcs[state.settings.questNpcId]?.name ?? '这位';
 
   return (
     <aside className="panel task-panel" aria-label="任务清单">
@@ -103,6 +106,11 @@ export function TaskPanel() {
           visibleTasks.map((task) => <TaskItem key={task.id} task={task} />)
         )}
       </div>
+
+      {/* npc 模式：玩家自己的行囊放在需求清单占位提示下面（A-2） */}
+      {state.settings.chatMode === 'npc' ? (
+        <PlayerBagPanel npcId={state.settings.questNpcId} npcName={npcName} />
+      ) : null}
 
       <div className="task-panel__footer">
         <button type="button" className="btn btn--tiny btn--ghost" onClick={() => setShowAudit((value) => !value)}>

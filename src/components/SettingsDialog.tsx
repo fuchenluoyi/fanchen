@@ -1,6 +1,6 @@
 import { useEffect, useState } from 'react';
 import { useStore } from '../state/store.tsx';
-import { DEFAULT_SETTINGS, DEFAULT_SYSTEM_PROMPT, npcPersonaDraft } from '../lib/settings.ts';
+import { DEFAULT_SETTINGS, DEFAULT_SYSTEM_PROMPT, NPC_ID_LIST, NPC_NAME } from '../lib/settings.ts';
 import { NPC_SEEDS } from '../lib/quest/world.ts';
 import type { ChatMode, ExtractMode, Settings } from '../types.ts';
 
@@ -18,7 +18,7 @@ const EXTRACT_MODE_OPTIONS: Array<{ value: ExtractMode; label: string }> = [
 
 /** 设置面板（FR-002 / FR-003）。 */
 export function SettingsDialog({ open, onClose }: Props) {
-  const { state, updateSettings, testConnection, listModels, resetAll } = useStore();
+  const { state, updateSettings, testConnection, listModels, resetAll, resetConversation } = useStore();
   const [draft, setDraft] = useState<Settings>(state.settings);
   const [showKey, setShowKey] = useState(false);
   const [models, setModels] = useState<string[]>([]);
@@ -39,6 +39,20 @@ export function SettingsDialog({ open, onClose }: Props) {
 
   const set = <K extends keyof Settings>(key: K, value: Settings[K]) =>
     setDraft((current) => ({ ...current, [key]: value }));
+
+  /** 只改某一位 NPC 的人格补充（别的两位不受影响） */
+  const setPersona = (npcId: string, text: string) =>
+    setDraft((current) => ({
+      ...current,
+      npcPersonas: { ...current.npcPersonas, [npcId]: text },
+    }));
+
+  const clearPersona = (npcId: string) =>
+    setDraft((current) => {
+      const next = { ...current.npcPersonas };
+      delete next[npcId];
+      return { ...current, npcPersonas: next };
+    });
 
   const doListModels = async () => {
     setPending('正在拉取模型列表…');
@@ -261,34 +275,68 @@ export function SettingsDialog({ open, onClose }: Props) {
           </section>
 
           <section className="form-section">
-            <h3>{draft.chatMode === 'npc' ? '人格补充' : '角色人格'}</h3>
-            <label className="field">
-              <span>{draft.chatMode === 'npc' ? '人格补充（可选）' : 'System Prompt'}</span>
-              <textarea
-                rows={8}
-                // 框里显示什么 = 会不会真的被追加：判据走 npcPersonaDraft（内部就是生效规则 isCustomPersona），
-                // 所以老用户存着的默认「说书人」人格不会显示成一框"看似生效其实被跳过"的文字
-                value={draft.chatMode === 'npc' ? npcPersonaDraft(draft.systemPrompt) : draft.systemPrompt}
-                onChange={(event) => set('systemPrompt', event.target.value)}
-              />
-              <small>
-                {draft.chatMode === 'npc'
-                  ? '框里显示什么，就会被真的追加什么：留空 = 只用内置的 NPC 框架；一旦手写内容，就作为「额外人格补充」追加进去（旧的默认人格不会被带进 npc 模式）。'
-                  : '整段直接作为 system 提示词发给模型。'}
-              </small>
-            </label>
-            <div className="field field--inline">
-              <button
-                type="button"
-                className="btn btn--ghost btn--sm"
-                onClick={() => set('systemPrompt', draft.chatMode === 'npc' ? '' : DEFAULT_SYSTEM_PROMPT)}
-              >
-                {draft.chatMode === 'npc' ? '清空人格补充' : '恢复默认人格'}
-              </button>
-              <button type="button" className="btn btn--ghost btn--sm" onClick={() => setDraft(DEFAULT_SETTINGS)}>
-                恢复全部默认值
-              </button>
-            </div>
+            <h3>{draft.chatMode === 'npc' ? '人格补充（按 NPC）' : '角色人格'}</h3>
+            {draft.chatMode === 'npc' ? (
+              <>
+                <div className="field field--inline">
+                  {NPC_ID_LIST.map((id) => (
+                    <button
+                      key={id}
+                      type="button"
+                      className={`btn btn--tiny ${id === draft.questNpcId ? 'btn--active' : 'btn--ghost'}`}
+                      onClick={() => set('questNpcId', id)}
+                      title={id === draft.questNpcId ? '正在编辑这一位' : `切到 ${NPC_NAME[id] ?? id}`}
+                    >
+                      {NPC_NAME[id] ?? id}
+                    </button>
+                  ))}
+                </div>
+                <label className="field">
+                  <span>为 {NPC_NAME[draft.questNpcId] ?? draft.questNpcId} 写人格补充（可选）</span>
+                  <textarea
+                    rows={8}
+                    value={draft.npcPersonas[draft.questNpcId] ?? ''}
+                    onChange={(event) => setPersona(draft.questNpcId, event.target.value)}
+                  />
+                  <small>
+                    这段只追加给**这一位** NPC（三人各写各的，互不串味）。留空 = 只用内置框架。
+                    以前那一段全局补充不会被带进来，需要的话在这里按人重填。
+                  </small>
+                </label>
+                <div className="field field--inline">
+                  <button type="button" className="btn btn--ghost btn--sm" onClick={() => clearPersona(draft.questNpcId)}>
+                    清空这一位的补充
+                  </button>
+                  <button type="button" className="btn btn--ghost btn--sm" onClick={() => setDraft(DEFAULT_SETTINGS)}>
+                    恢复全部默认值
+                  </button>
+                </div>
+              </>
+            ) : (
+              <>
+                <label className="field">
+                  <span>System Prompt</span>
+                  <textarea
+                    rows={8}
+                    value={draft.systemPrompt}
+                    onChange={(event) => set('systemPrompt', event.target.value)}
+                  />
+                  <small>整段直接作为 system 提示词发给模型。</small>
+                </label>
+                <div className="field field--inline">
+                  <button
+                    type="button"
+                    className="btn btn--ghost btn--sm"
+                    onClick={() => set('systemPrompt', DEFAULT_SYSTEM_PROMPT)}
+                  >
+                    恢复默认人格
+                  </button>
+                  <button type="button" className="btn btn--ghost btn--sm" onClick={() => setDraft(DEFAULT_SETTINGS)}>
+                    恢复全部默认值
+                  </button>
+                </div>
+              </>
+            )}
           </section>
 
           {status ? <div className={`notice notice--${status.kind}`}>{status.text}</div> : null}
@@ -296,6 +344,18 @@ export function SettingsDialog({ open, onClose }: Props) {
         </div>
 
         <footer className="modal__footer">
+          <button
+            type="button"
+            className="btn btn--ghost btn--danger-text"
+            onClick={() => {
+              if (window.confirm('将清空对话、任务与委托进度，但保留设置与 API Key。确定继续？')) {
+                resetConversation();
+                onClose();
+              }
+            }}
+          >
+            重置对话与进度
+          </button>
           <button
             type="button"
             className="btn btn--ghost btn--danger-text"

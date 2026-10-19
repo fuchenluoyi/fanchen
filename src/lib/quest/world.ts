@@ -8,7 +8,7 @@
  * 查询函数（inspect* / openQuestOfNpc / ...）是纯读；
  * 带 `draft` 字样的辅助函数只允许裁决层在草案世界上调用。
  */
-import { getItem } from './items.ts';
+import { ITEM_LIST, getItem } from './items.ts';
 import { availableOf, createInventory, listAvailable, listHolds, totalOf } from './inventory.ts';
 import type {
   ItemDef,
@@ -145,12 +145,37 @@ export function spareItems(npc: NpcState): ItemDef[] {
   return biasItems(npc, 'spare');
 }
 
-/** 玩家开局背包（寻药这类任务需要玩家先有可交之物） */
+/**
+ * 玩家开局背包的**显式**条目：这几件多给一点，其余的按下表补齐到 1 件。
+ * 寻药这类委托需要玩家先有可交之物 —— 所以这里给的是 2 件，别的只给 1 件当"见过面"。
+ */
 export const DEFAULT_PLAYER_INVENTORY: readonly ItemStack[] = [
   { itemId: 'sanqi', count: 1 },
   { itemId: 'gancao', count: 2 },
   { itemId: 'rations', count: 2 },
 ];
+
+/**
+ * 把显式条目补齐成「道具表里每一件都至少 ×1」：已列出的保持原量，缺的补 1 件。
+ * 只改内容、不重复加 —— 同一件道具在结果里只会出现一次。
+ */
+export function completePlayerInventory(base: readonly ItemStack[] = []): ItemStack[] {
+  const countOf = new Map<string, number>();
+  for (const stack of base) {
+    countOf.set(stack.itemId, (countOf.get(stack.itemId) ?? 0) + stack.count);
+  }
+  for (const def of ITEM_LIST) {
+    if (!countOf.has(def.id)) countOf.set(def.id, 1);
+  }
+  return [...countOf.entries()].map(([itemId, count]) => ({ itemId, count }));
+}
+
+/**
+ * 玩家**开局**背包 = 全部 32 件道具各至少 1 件（FR-027）。
+ *
+ * 只影响新世界（新存档）。老存档保持原样 —— 补领由玩家自己决定，不做隐式迁移。
+ */
+export const STARTING_PLAYER_INVENTORY: readonly ItemStack[] = completePlayerInventory(DEFAULT_PLAYER_INVENTORY);
 
 export interface CreateWorldOptions {
   playerName?: string;
@@ -180,7 +205,7 @@ export function createWorld(options: CreateWorldOptions = {}): World {
   const player: PlayerState = {
     id: DEFAULT_PLAYER_ID,
     name: options.playerName ?? '行客',
-    inventory: createInventory(DEFAULT_PLAYER_ID, [...(options.playerInventory ?? DEFAULT_PLAYER_INVENTORY)]),
+    inventory: createInventory(DEFAULT_PLAYER_ID, [...(options.playerInventory ?? STARTING_PLAYER_INVENTORY)]),
     affinity: {},
     stagePeak: {},
     impressionGainAt: {},

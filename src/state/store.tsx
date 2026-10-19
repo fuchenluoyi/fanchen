@@ -28,16 +28,20 @@ import type { QuestChannelEvent, QuestRuling } from '../lib/quest/bridge.ts';
 import {
   applyPlayerAccept,
   applyPlayerDecline,
+  applyPlayerGift,
+  applyPlayerRestock,
   applyPlayerSubmit,
   applyQuestEvent,
   applyQuestImpression,
 } from '../lib/quest/bridge.ts';
 import { normalizeStoredWorld } from '../lib/quest/persist.ts';
 import { buildNpcSystemPrompt } from '../lib/quest/prompt.ts';
+import { questLetter } from '../lib/quest/letter.ts';
+import { getNpc, getQuest } from '../lib/quest/world.ts';
 import type { ItemStack, World } from '../lib/quest/types.ts';
 import { QUEST_ACTION_LABEL, playerQuestRejectionText } from '../lib/labels.ts';
 import { messagesOfThread, normalizeThreadId, threadIdFor } from '../lib/threads.ts';
-import { buildRequestMessages, hasCredentials, loadSettings, normalizeSettings, saveSettings } from '../lib/settings.ts';
+import { buildRequestMessages, hasCredentials, loadSettings, normalizeSettings, npcPersonaFor, saveSettings } from '../lib/settings.ts';
 import { STORAGE_KEYS, isArrayOfObjects, loadJson, removeKeys, saveJson } from '../lib/storage.ts';
 import { createId } from '../lib/id.ts';
 import { ApiError, fetchHealth, fetchModels, streamChat } from '../lib/api.ts';
@@ -274,6 +278,12 @@ export interface StoreValue {
   declineQuest: (questId: string, reason?: string) => void;
   /** 玩家点【交付 / 请对方验看】：走裁决层提交（交付型带 deliver，非交付型不带） */
   deliverQuest: (questId: string, deliver?: ItemStack) => void;
+  /** 玩家点【送给他】：白送一件道具给 NPC（与委托无关，同样走裁决层） */
+  giftQuest: (npcId: string, itemId: string, count: number) => void;
+  /** 玩家点【补齐行囊】：每件道具补到 64（世界补给，非守恒） */
+  restockInventory: () => void;
+  /** 只重置对话 / 任务 / 委托进度，**保留设置与 API Key** */
+  resetConversation: () => void;
   setTaskStatus: (id: string, status: TaskStatus) => void;
   removeTask: (id: string) => void;
   clearMessages: () => void;
@@ -340,6 +350,31 @@ export function StoreProvider({ children }: { children: ReactNode }) {
     void refreshHealth();
   }, [refreshHealth]);
 
+  /* -------------------- NPC 留言（结算后她留一句话） -------------------- */
+
+  /**
+   * 委托了结后，把这位 NPC 的**留言**追加到她的对话线索里。
+   * 文案由 `questLetter` 确定性生成（不额外调模型）；重放（applied 为空）不追加，免得重复。
+   */
+  const appendQuestLetter = useCallback((world: World, questId: string | null, applied: readonly string[]) => {
+    if (!questId || applied.length === 0) return;
+    const quest = getQuest(world, questId);
+    if (!quest || quest.status !== 'settled') return;
+    const npc = getNpc(world, quest.requesterId);
+    if (!npc) return;
+    const text = questLetter(quest, npc);
+    if (!text) return;
+    const message: ChatMessage = {
+      id: createId('msg'),
+      role: 'assistant',
+      content: text,
+      npcId: quest.requesterId,
+      createdAt: Date.now(),
+      status: 'done',
+    };
+    dispatch({ type: 'message/add', payload: message });
+  }, []);
+
   /* -------------------- 发送一轮对话 -------------------- */
   const send = useCallback(async (raw: string) => {
     const text = raw.trim();
@@ -397,7 +432,12 @@ export function StoreProvider({ children }: { children: ReactNode }) {
     const extraImpressions: string[] = [];
     // 只读真相随之进 prompt：只有 NPC 自己的视角（ADR-013）
     const systemContent = npcMode
-      ? buildNpcSystemPrompt(worldDraft, settings.questNpcId, current.lastRuling, settings.systemPrompt)
+      ? buildNpcSystemPrompt(
+          worldDraft,
+          settings.questNpcId,
+          current.lastRuling,
+          npcPersonaFor(settings, settings.questNpcId),
+        )
       : undefined;
 
     try {
@@ -511,13 +551,20 @@ export function StoreProvider({ children }: { children: ReactNode }) {
       worldDraft = { ...worldDraft, player: { ...worldDraft.player, talks } };
 
       if (worldDraft !== current.world) dispatch({ type: 'world/set', payload: worldDraft });
-      const lastRuling = rulings.length > 0 ? rulings[rulings.length - 1] : null;
-      // 无条件写入：裁决事实只回注一轮 —— 本轮没有新裁决就清空，
-      // 免得两轮前那条拒绝被一直当成"刚刚发生"（事实会过期，还白烧一段 token）
-      dispatch({ type: 'ruling/set', payload: lastRuling });
+      const freshRuling = rulings.length > 0 ? rulings[rulings.length - 1] : null;
+      // **成功**的裁决事实不随轮次过期：本轮没有新裁决时，继续回注上一次成功的那条
+      // （交付已经发生是世界状态，不是"刚刚发生"的临时消息；否则界面按钮交的货，
+      //  NPC 下一轮就忘了，会一直催"东西呢"）。
+      // **拒绝**只活一轮 —— 它是即时纠正，留着只会让 NPC 以为"刚刚又被拒了"。
+      const carried = current.lastRuling && current.lastRuling.ok ? current.lastRuling : null;
+      dispatch({ type: 'ruling/set', payload: freshRuling ?? carried });
       // 每一笔裁决都留痕；拒绝绝不静默
       for (const ruling of rulings) {
         dispatch({ type: 'audit/push', payload: buildQuestAudit(ruling, assistantMessage.id, durationMs) });
+        // 对话里交付成功的，也留一句她的留言（跟界面按钮交付同一条路径）
+        if (ruling.ok && ruling.action === 'submit_quest') {
+          appendQuestLetter(worldDraft, ruling.questId, ruling.applied);
+        }
       }
       // 被忽略的重复印象调用也留痕（多调无效，但不能静默）
       for (const note of extraImpressions) {
@@ -540,8 +587,8 @@ export function StoreProvider({ children }: { children: ReactNode }) {
       const rejected = rulings.find((ruling) => !ruling.ok);
       if (rejected) {
         dispatch({ type: 'toast/set', payload: `系统驳回（${rejected.code ?? 'unknown'}）：${rejected.message}` });
-      } else if (lastRuling) {
-        dispatch({ type: 'toast/set', payload: lastRuling.message });
+      } else if (freshRuling) {
+        dispatch({ type: 'toast/set', payload: freshRuling.message });
       } else if (streamError) {
         dispatch({
           type: 'audit/push',
@@ -631,7 +678,7 @@ export function StoreProvider({ children }: { children: ReactNode }) {
     });
 
     if (notices.length > 0) dispatch({ type: 'toast/set', payload: notices[0] });
-  }, []);
+  }, [appendQuestLetter]);
 
   const stop = useCallback(() => {
     abortRef.current?.abort();
@@ -721,6 +768,58 @@ export function StoreProvider({ children }: { children: ReactNode }) {
         ? outcome.ruling.message
         : playerQuestRejectionText(outcome.ruling.code, outcome.ruling.message),
     });
+    // 了结后她留一句 —— 只在真的发生结算时追加（幂等重放不重复）
+    if (outcome.ruling.ok) appendQuestLetter(outcome.world, questId, outcome.ruling.applied);
+  }, [appendQuestLetter]);
+
+  /**
+   * 玩家点【送给他】：白送一件道具给当前 NPC。
+   * 跟交付一样走裁决层：够不够由代码判定，NPC 不能以「用不上」为由拒收（NFR-013）。
+   */
+  const giftQuest = useCallback((npcId: string, itemId: string, count: number) => {
+    const current = stateRef.current;
+    const outcome = applyPlayerGift(current.world, {
+      npcId,
+      itemId,
+      count,
+      requestId: createId('req'),
+      now: Date.now(),
+    });
+    dispatch({ type: 'world/set', payload: outcome.world });
+    dispatch({ type: 'ruling/set', payload: outcome.ruling });
+    dispatch({ type: 'audit/push', payload: buildQuestAudit(outcome.ruling, null, 0) });
+    dispatch({
+      type: 'toast/set',
+      payload: outcome.ruling.ok
+        ? outcome.ruling.message
+        : playerQuestRejectionText(outcome.ruling.code, outcome.ruling.message),
+    });
+  }, []);
+
+  /** 玩家点【补齐行囊】：每种道具补到 64（已够的不动） */
+  const restockInventory = useCallback(() => {
+    const current = stateRef.current;
+    const outcome = applyPlayerRestock(current.world, { requestId: createId('req'), now: Date.now() });
+    dispatch({ type: 'world/set', payload: outcome.world });
+    dispatch({ type: 'ruling/set', payload: outcome.ruling });
+    dispatch({ type: 'audit/push', payload: buildQuestAudit(outcome.ruling, null, 0) });
+    dispatch({
+      type: 'toast/set',
+      payload: outcome.ruling.ok
+        ? outcome.ruling.message
+        : playerQuestRejectionText(outcome.ruling.code, outcome.ruling.message),
+    });
+  }, []);
+
+  /**
+   * 只重置「对话与进度」：清掉对话、任务、委托世界三份数据，
+   * **保留设置**（含 API Key、模型、按 NPC 的人格补充）。
+   */
+  const resetConversation = useCallback(() => {
+    const keptSettings = stateRef.current.settings;
+    removeKeys([STORAGE_KEYS.messages, STORAGE_KEYS.tasks, STORAGE_KEYS.quest]);
+    dispatch({ type: 'data/reset', payload: keptSettings });
+    dispatch({ type: 'toast/set', payload: '已重置对话与进度（设置与 API Key 保留）' });
   }, []);
 
   const setTaskStatus = useCallback((id: string, status: TaskStatus) => {
@@ -799,6 +898,9 @@ export function StoreProvider({ children }: { children: ReactNode }) {
       acceptQuest,
       declineQuest,
       deliverQuest,
+      giftQuest,
+      restockInventory,
+      resetConversation,
       setTaskStatus,
       removeTask,
       clearMessages,
@@ -822,6 +924,9 @@ export function StoreProvider({ children }: { children: ReactNode }) {
       acceptQuest,
       declineQuest,
       deliverQuest,
+      giftQuest,
+      restockInventory,
+      resetConversation,
       setTaskStatus,
       removeTask,
       clearMessages,

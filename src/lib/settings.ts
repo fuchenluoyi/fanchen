@@ -40,7 +40,8 @@ export const NPC_PERSONA_PROMPT = [
   '   在系统明确确认"已收到"之前，绝不能说"我收下了""多谢你的三七"这类话。',
   '2. 想请对方办事时，调用 propose_quest 发布委托；一次只挂一条，手上的委托没了结之前不要再发第二条。',
   '3. 对方明确表示不接这条委托时，调用 decline_quest。',
-  '4. 目标道具与谢礼只能在下面列出的道具清单里挑，不许自己编造道具。',
+  '4. 目标道具与谢礼只能在下面「道具 id 拼写表」里抄 id；**谢礼只能从「我能拿出的谢礼」里挑**，',
+  '   已经送给对方的东西不再属于你，不能用"照旧"再许一次，也不许编造道具。',
   '5. 用自然口语说话，每次回复 2-5 句，不要长篇大论，也不要念规则。',
 ].join('\n');
 
@@ -62,7 +63,17 @@ export const DEFAULT_SETTINGS: Settings = {
   // 默认就走 NPC 委托：刷新页面就能看见委托卡
   chatMode: 'npc',
   questNpcId: DEFAULT_QUEST_NPC_ID,
+  // 每位 NPC 各写各的补充；空 = 只用内置框架（不再有全局共享的那一份）
+  npcPersonas: {},
 };
+
+/** 可以写人格补充的 NPC（设置界面按这个顺序列） */
+export const NPC_ID_LIST: readonly string[] = NPC_SEEDS.map((npc) => npc.id);
+
+/** 设置界面展示用的「id → 名字」 */
+export const NPC_NAME: Record<string, string> = Object.fromEntries(
+  NPC_SEEDS.map((npc) => [npc.id, `${npc.name}·${npc.title}`]),
+);
 
 const NPC_IDS: readonly string[] = NPC_SEEDS.map((npc) => npc.id);
 
@@ -108,26 +119,39 @@ export function normalizeSettings(raw: unknown): Settings {
     showReasoning: asBoolean(source.showReasoning, DEFAULT_SETTINGS.showReasoning),
     chatMode,
     questNpcId,
+    npcPersonas: normalizePersonas(source.npcPersonas),
   };
 }
 
 /**
+ * 归一化「按 NPC 的人格补充」：key 只认白名单里的三位，值 trim 后为空的丢掉。
+ * 旧存档的全局 `systemPrompt` **不迁移**进来（否则一段苏晚照的设定会同时套到三个人身上）。
+ */
+function normalizePersonas(source: unknown): Record<string, string> {
+  const out: Record<string, string> = {};
+  if (!source || typeof source !== 'object' || Array.isArray(source)) return out;
+  const record = source as Record<string, unknown>;
+  for (const id of NPC_IDS) {
+    const value = record[id];
+    if (typeof value !== 'string') continue;
+    const trimmed = value.trim();
+    if (trimmed) out[id] = trimmed;
+  }
+  return out;
+}
+
+/** 取某位 NPC 的人格补充（没写就是空串，只用内置框架） */
+export function npcPersonaFor(settings: Pick<Settings, 'npcPersonas'>, npcId: string): string {
+  return (settings.npcPersonas?.[npcId] ?? '').trim();
+}
+
+/**
  * 用户是否**自己写过**人格。
- * npc 模式只在确实自定义过时才把这段贴进去 —— 否则老用户 localStorage 里存的
- * 那段"说书人"人格会和 NPC 视角打架（AC：desk 模式行为一字不变）。
+ * 只在确实自定义过时才把这段贴进去 —— 否则默认人格会和 NPC 视角打架。
  */
 export function isCustomPersona(prompt: string): boolean {
   const trimmed = String(prompt ?? '').trim();
   return trimmed.length > 0 && trimmed !== DEFAULT_SYSTEM_PROMPT.trim();
-}
-
-/**
- * npc 模式下「人格补充」输入框应当显示的内容。
- * 判据与生效规则**同源**（都走 isCustomPersona），所以
- * 「框里显示什么」永远等于「会不会真的被追加」，不会出现"满框文字其实被跳过"。
- */
-export function npcPersonaDraft(systemPrompt: string): string {
-  return isCustomPersona(systemPrompt) ? systemPrompt : '';
 }
 
 export function loadSettings(): Settings {

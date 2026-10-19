@@ -38,7 +38,7 @@ import type {
   ObjectivePrimitive,
 } from './types.ts';
 import { addItems, availableOf, consumeHold, holdItem, releaseHoldsForQuest, removeAvailable } from './inventory.ts';
-import { itemName } from './items.ts';
+import { ITEM_LIST, isKnownItem, itemName } from './items.ts';
 import {
   assertObjectiveSupported,
   describeObjective,
@@ -678,6 +678,139 @@ export function noteImpression(world: World, input: NoteImpressionInput): Adjudi
       at: now,
     });
     commit(draft, input.requestId, 'note_impression', fingerprint, null);
+    return { ok: true, world: draft, quest: null, replay: false, applied };
+  } catch (err) {
+    return toRejection(world, err, null);
+  }
+}
+
+/* ============================ 赠送（不从属于任何委托） ============================ */
+
+export interface GiftItemInput {
+  requestId: string;
+  /** 收礼的 NPC */
+  npcId: string;
+  itemId: string;
+  count: number;
+  now?: number;
+}
+
+/**
+ * 赠送：玩家把道具**白送**给 NPC，与委托无关（FR-028）。
+ *
+ * 语义上它只是「一次转移」，所以只有两类硬判定：
+ *   1. **守恒**：道具从玩家背包挪到 NPC 背包，总量不变（`worldTotalOf` 前后相等）；
+ *   2. **够不够**：玩家可用量不足就拒绝。
+ *
+ * **NPC 不得以「不喜欢 / 用不上」为由拒收** —— 收礼不破坏任何守恒，
+ * 主观估值按 ADR-016 / NFR-013 只进叙事，绝不做驳回依据。
+ * 这也是它跟 `submitQuest` 的根本差别：赠送**不产生委托**、**不改委托状态**。
+ */
+export function giftItem(world: World, input: GiftItemInput): Adjudication {
+  try {
+    requireRequestId(input.requestId);
+    if (!Number.isInteger(input.count) || input.count < 1) {
+      throw new QuestError('invalid_gift_count', ERROR_MESSAGE.invalid_gift_count);
+    }
+    const itemId = typeof input.itemId === 'string' ? input.itemId.trim() : '';
+    if (!itemId) throw new QuestError('invalid_field', 'itemId 不能为空');
+    if (!isKnownItem(itemId)) throw new QuestError('unknown_item', ERROR_MESSAGE.unknown_item);
+
+    const fingerprint = { npcId: input.npcId, itemId, count: input.count };
+    const { replay, draft } = begin(world, input.requestId, 'gift_item', fingerprint);
+    if (replay) return replay;
+    const now = input.now ?? Date.now();
+
+    const npc = getNpc(draft, input.npcId);
+    if (!npc) throw new QuestError('unknown_npc', `没有这个 NPC：${input.npcId}`);
+
+    const have = availableOf(draft.player.inventory, itemId);
+    if (have < input.count) {
+      throw new QuestError(
+        'player_item_insufficient',
+        `你身上只有 ${have} 份「${itemName(itemId)}」，送不出 ${input.count} 份`,
+      );
+    }
+
+    const name = itemName(itemId);
+    draft.player.inventory = removeAvailable(draft.player.inventory, itemId, input.count);
+    npc.inventory = addItems(npc.inventory, [{ itemId, count: input.count }]);
+
+    const applied = [`赠礼：「${name}」×${input.count} 由玩家转交给 ${npc.name}`];
+    draftPushEvent(draft, {
+      type: 'item_gifted',
+      questId: null, // 赠送不属于任何委托
+      npcId: npc.id,
+      detail: `收下「${name}」×${input.count}`,
+      at: now,
+    });
+    commit(draft, input.requestId, 'gift_item', fingerprint, null);
+    return { ok: true, world: draft, quest: null, replay: false, applied };
+  } catch (err) {
+    return toRejection(world, err, null);
+  }
+}
+
+/* ============================ 行囊补齐（初始化便利，非守恒） ============================ */
+
+/** 补齐的目标数量：每件道具补到这个数（不够才补，已超过的不动） */
+export const RESTOCK_TARGET = 64;
+
+export interface RestockInput {
+  requestId: string;
+  /** 每件补到多少，默认 {@link RESTOCK_TARGET} */
+  target?: number;
+  now?: number;
+}
+
+/**
+ * 行囊补齐：把玩家背包里**每一种**道具补到目标数量（默认每件 64）。
+ *
+ * 注意它的性质：这是**世界初始化/补给**，不是「玩家 ↔ NPC 之间转移」，
+ * 所以它**故意违反守恒**（`addItems` 凭空生成）。因此：
+ *   - 单独成一个显式操作，不混进交付/赠送那条守恒路径；
+ *   - 幂等照旧（同一个 `requestId` 只补一次）；已经够数就什么也不做（重复点击无副作用）；
+ *   - 只在玩家背包上生效，不动 NPC 背包。
+ */
+export function restockPlayerInventory(world: World, input: RestockInput): Adjudication {
+  try {
+    requireRequestId(input.requestId);
+    const target = input.target ?? RESTOCK_TARGET;
+    if (!Number.isInteger(target) || target < 1) {
+      throw new QuestError('invalid_field', '补齐目标数量必须是 ≥ 1 的整数');
+    }
+    const fingerprint = { target };
+    const { replay, draft } = begin(world, input.requestId, 'restock_player', fingerprint);
+    if (replay) return replay;
+    const now = input.now ?? Date.now();
+
+    const additions: ItemStack[] = [];
+    for (const def of ITEM_LIST) {
+      const have = availableOf(draft.player.inventory, def.id);
+      if (have >= target) continue;
+      additions.push({ itemId: def.id, count: target - have });
+    }
+    if (additions.length === 0) {
+      return {
+        ok: true,
+        world,
+        quest: null,
+        replay: false,
+        applied: [`无需补齐：每件道具都已经不少于 ${target} 件`],
+      };
+    }
+
+    draft.player.inventory = addItems(draft.player.inventory, additions);
+    const detail = `行囊补齐：${additions.length} 种道具补到每件 ${target} 件`;
+    const applied = [detail];
+    draftPushEvent(draft, {
+      type: 'items_restocked',
+      questId: null, // 不是委托
+      npcId: draft.player.id,
+      detail,
+      at: now,
+    });
+    commit(draft, input.requestId, 'restock_player', fingerprint, null);
     return { ok: true, world: draft, quest: null, replay: false, applied };
   } catch (err) {
     return toRejection(world, err, null);

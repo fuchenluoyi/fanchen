@@ -234,7 +234,8 @@ describe('幂等与原子性', () => {
   });
 
   it('提交的幂等重放不会重复发奖', () => {
-    const world = createWorld();
+    // 显式背包：把基线钉住，免得「开局全量（A-1）」改变这条用例的预期
+    const world = createWorld({ playerInventory: [{ itemId: 'sanqi', count: 1 }] });
     const proposed = proposeQuest(world, propose());
     assert.equal(proposed.ok, true);
     if (!proposed.ok) return;
@@ -264,7 +265,8 @@ describe('幂等与原子性', () => {
 
 describe('完整链路：发布 → 接取 → 交付 → 扣除 → 发奖 → 结算', () => {
   it('道具守恒、事件齐全、任务收尾干净', () => {
-    const world = createWorld();
+    // 显式背包：守恒与发奖的基线不该随「开局全量（A-1）」漂移
+    const world = createWorld({ playerInventory: [{ itemId: 'sanqi', count: 1 }] });
     const sanqiBefore = worldTotalOf(world, 'sanqi');
     const gaoBefore = worldTotalOf(world, 'jinchuang-gao');
 

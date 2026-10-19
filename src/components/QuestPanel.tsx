@@ -2,6 +2,7 @@ import { useState } from 'react';
 import { useStore } from '../state/store.tsx';
 import { QUEST_STATUS_LABEL, formatTime } from '../lib/labels.ts';
 import {
+  ITEM_LIST,
   OFFER_LEVEL_LABEL,
   QUEST_TIER_LABEL,
   TIER_LABEL,
@@ -12,8 +13,11 @@ import {
   getNpc,
   inspectNpc,
   itemName,
+  listAvailable,
   objectiveItemRef,
   questsOfNpc,
+  questLetter,
+  tierOrder,
 } from '../lib/quest/index.ts';
 import type { Inventory, ItemStack, NpcSnapshot, Quest } from '../lib/quest/index.ts';
 
@@ -182,7 +186,11 @@ function QuestCard({
       ) : null}
 
       {quest.status === 'settled' ? (
-        <p className="candidate__evidence">已了结：谢礼已发出，预留锁已核销。</p>
+        <>
+          <p className="candidate__evidence">已了结：谢礼已发出，预留锁已核销。</p>
+          {/* 了结后她会留一句 —— 确定性文案，不额外调模型 */}
+          <p className="candidate__evidence">{questLetter(quest, { name: npcName })}</p>
+        </>
       ) : null}
     </article>
   );
@@ -230,6 +238,76 @@ function NpcBag({ snapshot }: { snapshot: NpcSnapshot }) {
           ))}
         </ul>
       )}
+    </div>
+  );
+}
+
+/**
+ * 「我的行囊」：玩家自己背包的**全量**视图（A-2）。
+ *
+ * 这是**玩家视角**：读 `player.inventory` 只用于展示，绝不注入提示词（ADR-013）。
+ * 每件道具都带一个【送给他】按钮 —— 赠送走裁决层（giftQuest），
+ * 界面不判断"他会不会收"：NPC 无权以用不上为由拒收（NFR-013）。
+ */
+export function PlayerBagPanel({ npcId, npcName }: { npcId: string; npcName: string }) {
+  const { state, giftQuest, restockInventory } = useStore();
+  const inventory = state.world.player.inventory;
+  const have = new Map(listAvailable(inventory).map((stack) => [stack.itemId, stack.count] as const));
+
+  // 全量表：按珍贵等级由低到高（凡 → 绝），同档按价值降序
+  const rows = [...ITEM_LIST].sort((a, b) => {
+    const tier = tierOrder(a.tier) - tierOrder(b.tier);
+    return tier !== 0 ? tier : b.value - a.value;
+  });
+  const owned = rows.filter((def) => (have.get(def.id) ?? 0) > 0).length;
+
+  return (
+    <div className="task-panel__candidates">
+      <div className="task-panel__candidates-head">
+        <span>
+          我的行囊
+          <span className="badge badge--muted">
+            {owned} / {rows.length} 种
+          </span>
+        </span>
+        <button
+          type="button"
+          className="btn btn--tiny btn--ghost"
+          onClick={restockInventory}
+          title="把每一种道具补到 64 件；已经够数的不会再加"
+        >
+          补齐行囊（每件 64）
+        </button>
+      </div>
+      <p className="empty-hint empty-hint--small">
+        点【送给他】把东西交给 {npcName}：走系统裁决，只看你身上够不够，{npcName} 不会挑三拣四。
+      </p>
+      <ul>
+        {rows.map((def) => {
+          const count = have.get(def.id) ?? 0;
+          return (
+            <li key={def.id} style={{ display: 'flex', alignItems: 'center', justifyContent: 'space-between', gap: 8 }}>
+              <span style={count === 0 ? { opacity: 0.45 } : undefined}>
+                {def.name}
+                <span className="badge badge--muted">{TIER_LABEL[def.tier]}</span>
+                ×{count}
+              </span>
+              {count > 0 ? (
+                <button
+                  type="button"
+                  className="btn btn--tiny btn--ghost"
+                  onClick={() => giftQuest(npcId, def.id, 1)}
+                  title={`把 1 件「${def.name}」送给 ${npcName}`}
+                >
+                  送给他
+                </button>
+              ) : (
+                <span className="badge badge--muted">没有</span>
+              )}
+            </li>
+          );
+        })}
+      </ul>
     </div>
   );
 }

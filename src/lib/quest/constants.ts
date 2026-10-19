@@ -165,4 +165,5 @@ export const ERROR_MESSAGE: Record<QuestErrorCode, string> = {
   insufficient_items: '库存不足',
   invalid_impression: '印象只能记成 pleased / neutral / offended 三种之一',
   impression_cooldown: '同一套恭维短期内重复太多次，这次不再加分',
+  invalid_gift_count: '赠送件数必须是正整数',
 };

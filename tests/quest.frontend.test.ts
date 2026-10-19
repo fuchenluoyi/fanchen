@@ -12,11 +12,19 @@ import assert from 'node:assert/strict';
 
 import { normalizeServerEvent, sanitizeQuestProposal } from '../src/lib/api.ts';
 import type { QuestProposalDraft, QuestRuling } from '../src/lib/quest/bridge.ts';
-import { applyPlayerAccept, applyPlayerSubmit, applyQuestEvent } from '../src/lib/quest/bridge.ts';
+import { applyPlayerAccept, applyPlayerGift, applyPlayerRestock, applyPlayerSubmit, applyQuestEvent } from '../src/lib/quest/bridge.ts';
 import { availableOf, auditInventory, totalOf } from '../src/lib/quest/inventory.ts';
+import { ITEM_LIST } from '../src/lib/quest/items.ts';
 import { normalizeStoredWorld } from '../src/lib/quest/persist.ts';
 import { buildNpcSystemPrompt } from '../src/lib/quest/prompt.ts';
-import { auditWorld, createWorld, getNpc, getQuest, worldTotalOf } from '../src/lib/quest/world.ts';
+import {
+  auditWorld,
+  completePlayerInventory,
+  createWorld,
+  getNpc,
+  getQuest,
+  worldTotalOf,
+} from '../src/lib/quest/world.ts';
 import { proposeQuest } from '../src/lib/quest/adjudicate.ts';
 import { playerQuestRejectionText } from '../src/lib/labels.ts';
 import {
@@ -26,9 +34,10 @@ import {
   buildRequestMessages,
   isCustomPersona,
   normalizeSettings,
-  npcPersonaDraft,
+  npcPersonaFor,
 } from '../src/lib/settings.ts';
-import type { ChatMode } from '../src/types.ts';
+import { buildRewardMenu } from '../src/lib/quest/prompt.ts';
+import { questLetter } from '../src/lib/quest/letter.ts';
 import type { World } from '../src/lib/quest/types.ts';
 
 /** 一条合法的模型提案（NPC 旧疾求药） */
@@ -82,34 +91,49 @@ describe('设置：对话模式与出面 NPC', () => {
     assert.equal(messages[0].content, 'NPC 框架');
   });
 
-  it('人格框显示什么 = 会不会真的被追加（同一个判据）', () => {
-    // 与 SettingsDialog 里 textarea 的 value 表达式同形，判据共用 npcPersonaDraft
-    const shownInDialog = (chatMode: ChatMode, systemPrompt: string): string =>
-      chatMode === 'npc' ? npcPersonaDraft(systemPrompt) : systemPrompt;
+  it('人格补充按 NPC 分槽：三人各写各的，老全局内容不迁移', () => {
+    // 默认全空：npc 模式只用内置框架
+    assert.deepEqual(DEFAULT_SETTINGS.npcPersonas, {});
+    assert.equal(npcPersonaFor(DEFAULT_SETTINGS, 'su-wanzhao'), '');
 
-    // 老用户 localStorage 里存着默认那段「说书人」人格：判否 → 框里显示空（不会"看似生效其实被跳过"）
-    assert.equal(isCustomPersona(DEFAULT_SETTINGS.systemPrompt), false);
-    assert.equal(shownInDialog('npc', DEFAULT_SETTINGS.systemPrompt), '');
-    // 「恢复全部默认值」之后 systemPrompt === DEFAULT_SYSTEM_PROMPT → 同样显示为空
-    assert.equal(shownInDialog('npc', DEFAULT_SYSTEM_PROMPT), '');
-    // 只有空白也算没自定义
-    assert.equal(shownInDialog('npc', '   '), '');
-    // 手写过的原样显示
-    assert.equal(shownInDialog('npc', '你说话带点川音。'), '你说话带点川音。');
-    // desk 模式一字不改
-    assert.equal(shownInDialog('desk', DEFAULT_SETTINGS.systemPrompt), DEFAULT_SYSTEM_PROMPT);
-    assert.equal(shownInDialog('desk', ''), '');
+    // 只认白名单里的 key；值 trim，空串丢弃
+    const normalized = normalizeSettings({
+      npcPersonas: {
+        'su-wanzhao': '  你说话带点川音。  ',
+        'lu-xingzhou': '   ',
+        'a-lai': '你见谁都先笑一下。',
+        ghost: '这个不该留下',
+      },
+    });
+    assert.deepEqual(normalized.npcPersonas, {
+      'su-wanzhao': '你说话带点川音。',
+      'a-lai': '你见谁都先笑一下。',
+    });
+    assert.equal(npcPersonaFor(normalized, 'lu-xingzhou'), '');
 
-    // 闭环：框里显示为空 ⇒ 提示词里确实没有「额外人格补充」
+    // 旧存档里那段全局 systemPrompt 不再被当作 npc 人格（丢弃，不迁移）
+    const legacy = normalizeSettings({ systemPrompt: '你说话带点川音。' });
+    assert.equal(npcPersonaFor(legacy, 'su-wanzhao'), '');
+    assert.equal(legacy.systemPrompt, '你说话带点川音。'); // desk 模式照旧用
+  });
+
+  it('闭环：补充只追加给那一位，提示词里不会串到别人身上', () => {
     const world = createWorld();
-    assert.doesNotMatch(
-      buildNpcSystemPrompt(world, 'su-wanzhao', null, shownInDialog('npc', DEFAULT_SETTINGS.systemPrompt)),
-      /额外人格补充/,
+    const settings = normalizeSettings({ npcPersonas: { 'su-wanzhao': '你说话带点川音。' } });
+
+    const suPrompt = buildNpcSystemPrompt(world, 'su-wanzhao', null, npcPersonaFor(settings, 'su-wanzhao'));
+    assert.match(suPrompt, /额外人格补充[\s\S]*川音/);
+
+    const luPrompt = buildNpcSystemPrompt(world, 'lu-xingzhou', null, npcPersonaFor(settings, 'lu-xingzhou'));
+    assert.doesNotMatch(luPrompt, /额外人格补充/);
+    assert.doesNotMatch(luPrompt, /川音/);
+
+    // desk 路径一字未改
+    assert.equal(
+      buildRequestMessages({ ...DEFAULT_SETTINGS, systemPrompt: '说书人' }, [{ role: 'user', content: '你好' }])[0].content,
+      '说书人',
     );
-    assert.match(
-      buildNpcSystemPrompt(world, 'su-wanzhao', null, shownInDialog('npc', '你说话带点川音。')),
-      /额外人格补充[\s\S]*川音/,
-    );
+    assert.equal(isCustomPersona(DEFAULT_SYSTEM_PROMPT), false);
   });
 });
 
@@ -721,5 +745,296 @@ describe('玩家在界面上交付 / 完成（走裁决层）', () => {
     assert.equal(again.ruling.ok, false);
     assert.equal(again.ruling.code, 'quest_not_submittable');
     assert.match(playerQuestRejectionText(again.ruling.code, again.ruling.message), /已经了结/);
+  });
+});
+
+/* ============================ 开局背包：道具表全量（A-1） ============================ */
+
+describe('玩家开局背包：道具表里每一件都有', () => {
+  it('默认世界里 32 件道具每件至少 1 件，世界自检通过、玩家无预留', () => {
+    const world = createWorld();
+    for (const def of ITEM_LIST) {
+      assert.ok(availableOf(world.player.inventory, def.id) >= 1, `${def.id} 应该开局就有`);
+    }
+    assert.deepEqual(auditWorld(world), []);
+    assert.equal(world.player.inventory.holds.length, 0);
+  });
+
+  it('显式条目保持原量、不重复加（三七 1 / 甘草 2 / 干粮 2）', () => {
+    const world = createWorld();
+    assert.equal(availableOf(world.player.inventory, 'sanqi'), 1);
+    assert.equal(availableOf(world.player.inventory, 'gancao'), 2);
+    assert.equal(availableOf(world.player.inventory, 'rations'), 2);
+  });
+
+  it('completePlayerInventory 不重复：同一件只出现一次，数量相加', () => {
+    const filled = completePlayerInventory([
+      { itemId: 'sanqi', count: 3 },
+      { itemId: 'sanqi', count: 2 },
+    ]);
+    const sanqi = filled.filter((stack) => stack.itemId === 'sanqi');
+    assert.equal(sanqi.length, 1);
+    assert.equal(sanqi[0].count, 5);
+    assert.equal(filled.length, ITEM_LIST.length);
+  });
+
+  it('显式 playerInventory 仍可整份覆盖（测试用）', () => {
+    const custom = createWorld({ playerInventory: [{ itemId: 'water', count: 5 }] });
+    assert.equal(availableOf(custom.player.inventory, 'water'), 5);
+    assert.equal(availableOf(custom.player.inventory, 'sanqi'), 0);
+  });
+});
+
+/* ============================ 赠送（A-3） ============================ */
+
+describe('赠送：白送道具给 NPC（与委托无关）', () => {
+  it('送出 1 件：玩家 −1、NPC +1、总量不变、不产生委托、有事件', () => {
+    const base = createWorld();
+    const totalBefore = worldTotalOf(base, 'sanqi');
+    const npcBefore = totalOf(getNpc(base, 'su-wanzhao')!.inventory, 'sanqi');
+    const questsBefore = Object.keys(base.quests).length;
+
+    const outcome = applyPlayerGift(base, {
+      npcId: 'su-wanzhao',
+      itemId: 'sanqi',
+      count: 1,
+      requestId: 'gift-1',
+      now: 10,
+    });
+
+    assert.equal(outcome.ruling.ok, true);
+    assert.equal(outcome.ruling.action, 'gift_item');
+    assert.equal(outcome.ruling.questId, null);
+    assert.equal(availableOf(outcome.world.player.inventory, 'sanqi'), availableOf(base.player.inventory, 'sanqi') - 1);
+    assert.equal(totalOf(getNpc(outcome.world, 'su-wanzhao')!.inventory, 'sanqi'), npcBefore + 1);
+    assert.equal(worldTotalOf(outcome.world, 'sanqi'), totalBefore, '道具必须守恒');
+    assert.equal(Object.keys(outcome.world.quests).length, questsBefore, '赠送不产生委托');
+    assert.ok(outcome.world.events.some((event) => event.type === 'item_gifted' && event.questId === null));
+    assert.deepEqual(auditWorld(outcome.world), []);
+  });
+
+  it('幂等：同一 requestId 重放不再扣一次，世界是同一引用', () => {
+    const first = applyPlayerGift(createWorld(), {
+      npcId: 'a-lai',
+      itemId: 'rations',
+      count: 1,
+      requestId: 'gift-2',
+      now: 1,
+    });
+    assert.equal(first.ruling.ok, true);
+    const replay = applyPlayerGift(first.world, {
+      npcId: 'a-lai',
+      itemId: 'rations',
+      count: 1,
+      requestId: 'gift-2',
+      now: 2,
+    });
+    assert.equal(replay.ruling.ok, true);
+    assert.equal(replay.world, first.world);
+  });
+
+  it('不够就拒绝，世界逐字节不变', () => {
+    const base = createWorld({ playerInventory: [{ itemId: 'sanqi', count: 1 }] });
+    const snapshot = JSON.stringify(base);
+    const outcome = applyPlayerGift(base, {
+      npcId: 'su-wanzhao',
+      itemId: 'sanqi',
+      count: 2,
+      requestId: 'gift-3',
+      now: 1,
+    });
+    assert.equal(outcome.ruling.ok, false);
+    assert.equal(outcome.ruling.code, 'player_item_insufficient');
+    assert.equal(outcome.world, base);
+    assert.equal(JSON.stringify(base), snapshot);
+    assert.match(playerQuestRejectionText(outcome.ruling.code, outcome.ruling.message), /没有这件东西/);
+  });
+
+  it('件数非正 / 未登记道具 / 不认识的人：各自拒绝码', () => {
+    const base = createWorld();
+    const zero = applyPlayerGift(base, { npcId: 'su-wanzhao', itemId: 'sanqi', count: 0, requestId: 'g1', now: 1 });
+    assert.equal(zero.ruling.code, 'invalid_gift_count');
+    const unknown = applyPlayerGift(base, { npcId: 'su-wanzhao', itemId: 'made-up', count: 1, requestId: 'g2', now: 1 });
+    assert.equal(unknown.ruling.code, 'unknown_item');
+    const ghost = applyPlayerGift(base, { npcId: 'ghost', itemId: 'sanqi', count: 1, requestId: 'g3', now: 1 });
+    assert.equal(ghost.ruling.code, 'unknown_npc');
+  });
+
+  it('NPC 不得以「用不上」为由拒收（NFR-013）：送阿癞清水照样收下', () => {
+    const outcome = applyPlayerGift(createWorld(), {
+      npcId: 'a-lai',
+      itemId: 'water',
+      count: 1,
+      requestId: 'gift-4',
+      now: 1,
+    });
+    assert.equal(outcome.ruling.ok, true);
+    assert.equal(totalOf(getNpc(outcome.world, 'a-lai')!.inventory, 'water'), 1);
+  });
+});
+
+/* ==================== 提示词里的交付事实（NPC 不会再说"没收到"） ==================== */
+
+describe('提示词：交付事实现算，不靠上一轮裁决', () => {
+  /** 发布 → 接取 → 交付，得到一条已结算的委托 */
+  function settledGiftQuest(): { world: World; questId: string } {
+    const base = createWorld({ playerInventory: [{ itemId: 'gancao', count: 2 }] });
+    const proposed = applyQuestEvent(
+      base,
+      { type: 'quest_proposal', proposal: proposal({ objective: { kind: 'deliver_item', itemId: 'gancao', count: 1 } }) },
+      { npcId: 'su-wanzhao', requestId: 'req-1', dialogueId: 'msg-1', now: 1 },
+    );
+    assert.equal(proposed.ruling.ok, true);
+    const questId = proposed.ruling.questId ?? '';
+    const accepted = applyPlayerAccept(proposed.world, { questId, requestId: 'req-2', now: 2 });
+    assert.equal(accepted.ruling.ok, true);
+    const submitted = applyPlayerSubmit(accepted.world, {
+      questId,
+      requestId: 'req-3',
+      now: 3,
+      deliver: { itemId: 'gancao', count: 1 },
+    });
+    assert.equal(submitted.ruling.ok, true);
+    return { world: submitted.world, questId };
+  }
+
+  it('已结算的委托：提示词写明「已经收到的货」并禁止再催交付', () => {
+    const { world } = settledGiftQuest();
+    const prompt = buildNpcSystemPrompt(world, 'su-wanzhao', null, '');
+    assert.match(prompt, /已经收到的货：甘草 ×1/);
+    assert.match(prompt, /这条委托已经了结/);
+    assert.match(prompt, /绝不能再让他交付一次/);
+    assert.match(prompt, /也不要问「东西呢」/);
+  });
+
+  it('还没交付时不出现「已经收到的货」（不给模型编造的依据）', () => {
+    const base = createWorld({ playerInventory: [{ itemId: 'gancao', count: 2 }] });
+    const proposed = applyQuestEvent(
+      base,
+      { type: 'quest_proposal', proposal: proposal({ objective: { kind: 'deliver_item', itemId: 'gancao', count: 1 } }) },
+      { npcId: 'su-wanzhao', requestId: 'req-1', dialogueId: 'msg-1', now: 1 },
+    );
+    const prompt = buildNpcSystemPrompt(proposed.world, 'su-wanzhao', null, '');
+    assert.doesNotMatch(prompt, /已经收到的货/);
+  });
+
+  it('玩家背包仍然绝不出现在提示词里（ADR-013）', () => {
+    const { world } = settledGiftQuest();
+    const prompt = buildNpcSystemPrompt(world, 'su-wanzhao', null, '');
+    // 玩家多给的甘草还在自己包里，提示词里不应有「行囊 / 玩家背包」这种视角
+    assert.doesNotMatch(prompt, /玩家背包/);
+    assert.doesNotMatch(prompt, /我的行囊/);
+  });
+});
+
+/* ==================== 谢礼只能从自己背包里挑（竹哨事故） ==================== */
+
+describe('谢礼清单：只列她真正拿得出的东西', () => {
+  it('苏晚照拿不出竹哨：谢礼清单里没有它（竹哨只归陆行舟）', () => {
+    const world = createWorld();
+    const su = getNpc(world, 'su-wanzhao');
+    assert.ok(su);
+    const menu = buildRewardMenu(su!);
+    assert.match(menu, /我能拿出的谢礼/);
+    assert.match(menu, /金疮药/);
+    assert.doesNotMatch(menu, /竹哨/);
+    // 白名单（拼写表）仍然列出全部 32 件，但已明确「不是你能拿出的清单」
+    const prompt = buildNpcSystemPrompt(world, 'su-wanzhao', null, '');
+    assert.match(prompt, /道具 id 拼写表/);
+    assert.match(prompt, /不是"你能拿出来的东西"清单/);
+  });
+
+  it('空背包的 NPC：清单里直接说「一件也拿不出来」', () => {
+    const world = createWorld();
+    const ghostOfBag = buildRewardMenu(getNpc(world, 'a-lai')!);
+    assert.match(ghostOfBag, /一件也拿不出来/);
+  });
+
+  it('奖励被拒时，裁决事实会给出「换一件重提」的指引', () => {
+    const world = createWorld();
+    const proposed = applyQuestEvent(
+      world,
+      {
+        type: 'quest_proposal',
+        proposal: proposal({ reward: { kind: 'item', itemId: 'bamboo-whistle', count: 1 } }),
+      },
+      { npcId: 'su-wanzhao', requestId: 'req-1', dialogueId: 'msg-1', now: 1 },
+    );
+    assert.equal(proposed.ruling.ok, false);
+    assert.equal(proposed.ruling.code, 'reward_not_owned');
+
+    const prompt = buildNpcSystemPrompt(proposed.world, 'su-wanzhao', proposed.ruling, '');
+    assert.match(prompt, /怎么改/);
+    assert.match(prompt, /重新调用一次 propose_quest/);
+  });
+});
+
+/* ==================== 补齐行囊（每件 64） ==================== */
+
+describe('补齐行囊：每件补到 64，已够的不动', () => {
+  it('把缺的补到 64：32 种全部达到 64，已有更多的保持原样', () => {
+    const base = createWorld({ playerInventory: [{ itemId: 'sanqi', count: 100 }] });
+    const outcome = applyPlayerRestock(base, { requestId: 'restock-1', now: 1 });
+    assert.equal(outcome.ruling.ok, true);
+    assert.equal(outcome.ruling.action, 'restock_player');
+    assert.equal(availableOf(outcome.world.player.inventory, 'sanqi'), 100, '已经超过 64 的不动');
+    for (const def of ITEM_LIST) {
+      assert.ok(availableOf(outcome.world.player.inventory, def.id) >= 64, `${def.id} 应至少 64`);
+    }
+    assert.ok(outcome.world.events.some((event) => event.type === 'items_restocked'));
+    assert.deepEqual(auditWorld(outcome.world), []);
+  });
+
+  it('已经满额时不再加：世界原样返回（重复点击无副作用）', () => {
+    const once = applyPlayerRestock(createWorld(), { requestId: 'restock-1', now: 1 });
+    const twice = applyPlayerRestock(once.world, { requestId: 'restock-2', now: 2 });
+    assert.equal(twice.ruling.ok, true);
+    assert.equal(twice.world, once.world, '没有缺口就返回同一个世界');
+    assert.match(twice.ruling.applied[0] ?? '', /无需补齐/);
+  });
+
+  it('幂等：同一个 requestId 重放不再补一次', () => {
+    const first = applyPlayerRestock(createWorld(), { requestId: 'restock-1', now: 1 });
+    const replay = applyPlayerRestock(first.world, { requestId: 'restock-1', now: 2 });
+    assert.equal(replay.ruling.ok, true);
+    assert.equal(replay.world, first.world);
+  });
+});
+
+/* ==================== 结算后的 NPC 留言 ==================== */
+
+describe('NPC 留言：结算后她留一句（确定性，不调模型）', () => {
+  it('已结算：带名字、带收到的货、同一条委托永远同一句', () => {
+    const base = createWorld({ playerInventory: [{ itemId: 'gancao', count: 2 }] });
+    const proposed = applyQuestEvent(
+      base,
+      { type: 'quest_proposal', proposal: proposal({ objective: { kind: 'deliver_item', itemId: 'gancao', count: 1 } }) },
+      { npcId: 'su-wanzhao', requestId: 'req-1', dialogueId: 'msg-1', now: 1 },
+    );
+    const questId = proposed.ruling.questId ?? '';
+    const accepted = applyPlayerAccept(proposed.world, { questId, requestId: 'req-2', now: 2 });
+    const settled = applyPlayerSubmit(accepted.world, {
+      questId,
+      requestId: 'req-3',
+      now: 3,
+      deliver: { itemId: 'gancao', count: 1 },
+    });
+    const quest = getQuest(settled.world, questId)!;
+    const npc = getNpc(settled.world, 'su-wanzhao')!;
+    const letter = questLetter(quest, npc);
+    assert.match(letter, /苏晚照留了一句/);
+    assert.match(letter, /甘草×1/);
+    assert.equal(questLetter(quest, npc), letter, '确定性：两次调用一致');
+  });
+
+  it('没结算就没有留言', () => {
+    const world = createWorld();
+    const proposed = applyQuestEvent(
+      world,
+      { type: 'quest_proposal', proposal: proposal() },
+      { npcId: 'su-wanzhao', requestId: 'req-1', dialogueId: 'msg-1', now: 1 },
+    );
+    const quest = getQuest(proposed.world, proposed.ruling.questId ?? '')!;
+    assert.equal(questLetter(quest, getNpc(world, 'su-wanzhao')!), '');
   });
 });

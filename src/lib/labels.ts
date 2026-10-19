@@ -31,6 +31,8 @@ export const QUEST_ACTION_LABEL: Record<QuestRulingAction, string> = {
   decline_quest: '婉拒委托',
   accept_quest: '接取委托',
   note_impression: '记印象',
+  gift_item: '赠送',
+  restock_player: '补齐行囊',
 };
 
 export const CATEGORY_LABEL: Record<TaskCategory, string> = {
@@ -70,6 +72,8 @@ const PLAYER_REJECTION_HEADLINE: Record<string, string> = {
   quest_not_accepted: '这条委托不在进行中',
   quest_not_submittable: '这条委托已经了结了',
   quest_not_found: '找不到这条委托',
+  unknown_item: '没有这件东西',
+  invalid_gift_count: '数量得是正整数',
 };
 
 /**

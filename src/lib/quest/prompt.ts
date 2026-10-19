@@ -26,7 +26,7 @@ import {
   TIER_VALUE_RANGE,
 } from './constants.ts';
 import { listAvailable, listHolds } from './inventory.ts';
-import { getItem, itemsByTier } from './items.ts';
+import { getItem, itemName, itemsByTier } from './items.ts';
 import { describeObjective } from './objectives.ts';
 import { STAGES, describeAttitude, peakStageOf, progressToNextStage } from './relationship.ts';
 import { describeReward } from './rewards.ts';
@@ -104,7 +104,7 @@ function renderTastes(npc: NpcState): string {
 }
 
 function renderQuestLine(quest: Quest): string {
-  return [
+  const lines = [
     `- ${quest.id}「${quest.title}」`,
     `· 状态：${QUEST_STATUS_LABEL[quest.status]}`,
     `· 轻重：${QUEST_TIER_LABEL[quest.tier]}`,
@@ -112,7 +112,20 @@ function renderQuestLine(quest: Quest): string {
     `· 谢礼：${describeReward(quest.reward)}`,
     `· 档位：${OFFER_LEVEL_LABEL[quest.offerLevel]}`,
     `· 你想要的是：${quest.want}`,
-  ].join(' ');
+  ];
+  // 交付事实必须**现算**：Quest.delivered 是「道具真的被扣掉那一刻」的落库记录。
+  // 只靠 lastRuling 回注会过期 —— 上一轮交付过、这一轮 NPC 就"忘了自己收过"。
+  if (quest.delivered.length > 0) {
+    const received = quest.delivered.map((entry) => `${itemName(entry.itemId)} ×${entry.count}`).join('、');
+    lines.push(`· 已经收到的货：${received}（已入我手，不必再向对方讨要）`);
+  }
+  if (quest.status === 'settled') {
+    lines.push(
+      '· **这条委托已经了结**：对方该交的你已经收到、你答应的谢礼也已经给出。' +
+        '绝不能再让他交付一次，也不要问「东西呢」「我还没见着」—— 那是没发生过的事。',
+    );
+  }
+  return lines.join(' ');
 }
 
 function renderOwnQuests(world: World, npc: NpcState): string {
@@ -150,7 +163,9 @@ function renderRelationship(world: World, npc: NpcState): string {
 }
 
 function renderWhitelist(): string {
-  const lines = ['【可用的道具清单】（目标与谢礼只能从这里挑，id 必须原样写）'];
+  const lines = [
+    '【道具 id 拼写表】（**只是抄 id 用的字典**，不是"你能拿出来的东西"清单 —— 你能不能给，只看【我自己的背包】）',
+  ];
   for (const tier of TIER_LIST) {
     const items = itemsByTier(tier);
     if (items.length === 0) continue;
@@ -171,6 +186,28 @@ function renderWhitelist(): string {
   lines.push('');
   lines.push(
     '目标只能这样写（objective_kind）：deliver_item 交付道具 / has_item 只需持有 / talk_count 陪聊轮数 / affinity_at_least 好感达标。别的目标系统判不了，会被直接驳回。',
+  );
+  return lines.join('\n');
+}
+
+/**
+ * 「我能拿出的谢礼」：从**自己的背包**现算，模型引用的奖励必须命中这里。
+ * 白名单（32 件全表）只是抄 id 的字典 —— 苏晚照许诺"竹哨"那次，就是模型把它当菜单了。
+ */
+export function buildRewardMenu(npc: NpcState): string {
+  const available = listAvailable(npc.inventory);
+  const lines = ['【我能拿出的谢礼】（只有这些能用；表外的你没有，提都别提）'];
+  if (available.length === 0) {
+    lines.push('（一件也拿不出来 —— 这一轮不要提谢礼，也别发布委托。）');
+    return lines.join('\n');
+  }
+  for (const stack of available) {
+    const def = getItem(stack.itemId);
+    lines.push(`- ${def?.name ?? stack.itemId}（id: ${stack.itemId}）×${stack.count}`);
+  }
+  lines.push('（本次委托**所要之物**不能当谢礼，那会被判成自循环；要的与给的是同一件时，换别的，或者干脆不收谢礼。）');
+  lines.push(
+    '除了这些道具，也可以：给好感度（reward_kind=affinity）、教本事（ability，只限大事）、说一桩情报（info）、或者不收谢礼（none）。',
   );
   return lines.join('\n');
 }
@@ -199,14 +236,22 @@ function renderRuling(ruling: QuestRuling | null): string | null {
       '- 含义：**这些是已经发生的事实**，你可以据此说话 —— 但只限于上面写明的部分。',
     ].join('\n');
   }
-  return [
+  const lines = [
     '【上一轮系统裁决】',
     `- 结果：拒绝（${QUEST_ACTION_LABEL[ruling.action]}${suffix}）`,
     `- 原因码：${ruling.code ?? 'unknown'}`,
     `- 系统说明：${ruling.message}`,
     '- 含义：**这件事没有发生。**若被拒的是交付，那就意味着对方并没有把东西交到你手上：',
     '  绝不要道谢、不要说"我收下了"，也不要假装已经收到。你可以疑惑、可以追问，但事实以系统为准。',
-  ].join('\n');
+  ];
+  // 奖励被拒时给一条**可执行**的指引：否则她会反复重复那句拿不出来的承诺
+  if (ruling.code === 'reward_not_owned' || ruling.code === 'npc_reward_unavailable') {
+    lines.push(
+      '- 怎么改：上面那件谢礼你拿不出来，或者已经被别的委托占住了。',
+      '  换一件【我能拿出的谢礼】里有的，**重新调用一次 propose_quest**；不要再重复刚才那句承诺，也不要假装已经许出去了。',
+    );
+  }
+  return lines.join('\n');
 }
 
 /**
@@ -234,6 +279,7 @@ export function buildNpcSystemPrompt(
     NPC_PERSONA_PROMPT,
     renderIdentity(npc),
     renderOwnBag(npc),
+    buildRewardMenu(npc),
     renderTastes(npc),
     renderOwnQuests(world, npc),
     renderRelationship(world, npc),

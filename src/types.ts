@@ -88,6 +88,12 @@ export interface Settings {
   chatMode: ChatMode;
   /** npc 模式下由谁出面发布委托 */
   questNpcId: string;
+  /**
+   * npc 模式下**每位 NPC 各自**的人格补充（key = NPC id，空白 = 无补充）。
+   * 与 `systemPrompt` 分开：后者是 desk 模式的整段 system 提示词，两者互不干扰。
+   * 旧版本写在 `systemPrompt` 里那一段全局补充**不迁移**（否则会串到三个人身上）。
+   */
+  npcPersonas: Record<string, string>;
 }
 
 export interface HealthInfo {
